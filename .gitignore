@@ -1,0 +1,72 @@
+# Runtime copies are kept locally for diagnosis but never published by accident.
+src/**/__pycache__/
+scripts/**/__pycache__/
+tests/**/__pycache__/
+src/**/*.pyc
+tests/**/*.pyc
+src/**/logs/
+src/**/*.log
+src/**/gateway-*-stdout.log
+src/**/gateway-*-stderr.log
+src/**/headroom-*.stdout.log
+src/**/headroom-*.stderr.log
+src/**/headroom-*.stdout.txt
+src/**/headroom-*.stderr.txt
+src/**/headroom-startup-*.json
+src/**/headroom-startup-result-*.json
+src/**/headroom-state-*.json
+src/**/gateway-metrics-state.json
+src/**/gateway-process-state.json
+src/**/headroom-activation-*.json
+src/**/startup-result.json
+src/**/codexpp-headroom-monitor-*.json
+src/**/user_scripts.json
+runtime-artifacts/**/*.log
+runtime-artifacts/**/*.pid
+runtime-artifacts/**/*.lock
+runtime-artifacts/**/state*.json
+runtime-artifacts/**/startup*.json
+runtime-artifacts/
+backups/
+*.bak*
+onnxruntime_profile__*.json
+.venv/
+.pytest_cache/
+.codegraph/
+
+# Protected runtime data: credentials, sessions, and databases stay in place.
+**/*credential*
+**/*secret*
+**/*token*
+**/*auth*
+**/*session*
+**/*.db
+**/*.db-shm
+**/*.db-wal
+
+# Acceptance/session evidence and local route artifacts may contain prompts,
+# authorization headers, user paths, or process-specific identifiers.  Keep
+# the local copies for diagnosis, but never publish them with a blanket add.
+src/codexpp/Codex++/acceptance/reports/
+src/codexpp/Codex++/acceptance/**/*.jsonl
+src/codexpp/Codex++/acceptance/**/*.json
+src/codexpp/Codex++/*route*.json
+src/codexpp/Codex++/*route*.signal
+src/codexpp/Codex++/headroom-status-indicator.js
+src/codexpp/Codex++/*.exe
+evidence/runtime-clear-manifest.json
+
+# Model cache bookkeeping is not source; the materialized model files remain
+# locally available and are handled separately by the LFS rules.
+models/**/*.incomplete
+
+# Evidence allowlist: only the two generated, body-free acceptance records
+# are publishable. The clear manifest contains local paths and remains local.
+evidence/*
+!evidence/
+!evidence/cpu-kompress-ort-20260731.json
+!evidence/synthetic-acceptance-20260731.json
+
+# Model binaries are tracked with Git LFS because GitHub rejects ordinary
+# blobs over 100 MB. Publishing still requires the repository license/size
+# check and must not be used for credentials or session data.
