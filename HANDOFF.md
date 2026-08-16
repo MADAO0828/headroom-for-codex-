@@ -1839,4 +1839,14 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File "D:\新建文件夹\headroom for c
 - `real_spawned_post_restart=NOT_EXECUTED`：本轮没有启动子 Agent，不得把历史计数当作本轮 spawned 生产验收。
 - `50_main_50_spawned=NOT_EXECUTED`，`legacy_c_drive_cleanup=PENDING`。因此 P72 集成包仍为 `RUNNING`，但用户本轮报告的黄色项、时区显示和 Kompress 当前降级问题已关闭。
 
+## 2026-08-16 14:20 遗留边界收口
+
+- `synthetic_50x50=SUCCEEDED`：本地合同 50 main + 50 synthetic spawned 全部 200，504=0、分类错配=0；不可替代真实官方 spawned 验收。
+- `synthetic_accounting_fix=SOURCE_SUCCEEDED_RUNTIME_PENDING`：新增 synthetic header 和 token accounting exclusion；`test_gateway.py 35/35`、py_compile PASS。当前生产窗口仍有修复加载前 synthetic 缺失计量，需用户手动重启清零。
+- `github_release=PUBLISHED`：`origin/main` 提交 `021dc8e`，manifest `5867f39b...`，119 项，validator pass，未发布 runtime/private/evidence。
+- `legacy_c_drive=BLOCKED_ACTIVE_PROCESS`：PID `22844/460` 为官方 Codex PID `20252` 的 MCP 子进程，不能在本会话中安全停止或删除 C 盘目录。
+- `real_spawned_post_restart=NOT_EXECUTED`、`50_main_50_spawned_real=NOT_EXECUTED`。完整集成包仍 `RUNNING`。
+
+证据：`evidence/p72-boundary-closure-20260816.json`。作者：Codex，2026-08-16。
+
 回归测试：Responses 13、Broker 12、Remote 6、Gateway 34、Monitor 10、Indicator preflight 12、Indicator JS 13、runtime sync fixture 全部通过。旧 P71 candidate manifest 复核为 `drift`，因此本轮没有发布/部署候选；需重新生成并独立验收新 manifest。证据：`evidence/p72-post-restart-production-validation-20260816.json`。作者：Codex，2026-08-16。

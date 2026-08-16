@@ -1230,3 +1230,13 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File "D:\新建文件夹\headroom for c
 - 发布门禁：复核旧的 `evidence/candidate-manifest-p71-token-monitor-20260816.json` 得到 `drift`（README/HANDOFF 及部分源码已在其生成后更新）；本轮没有发布或部署候选，不能用该旧 manifest 报告可发布。
 
 证据：`evidence/p72-post-restart-production-validation-20260816.json`。作者：Codex，2026-08-16。
+
+## 2026-08-16 14:20 遗留边界收口（Codex）
+
+- 本地 synthetic `50 main + 50 spawned` 合同窗口通过：100/100 HTTP 200、504=0、bypass mismatch=0、负节省=0。该收据只证明 Gateway/Headroom 合同，不等同于真实官方 spawned 流量。
+- 修复 synthetic accounting：验收请求现在携带 `x-headroom-synthetic-run-id`，Gateway 将 synthetic 样本排除出精确生产 token accounting，避免本地压力测试把监视器置黄。源码测试 `test_gateway.py 35/35`、Python 编译通过；需要用户下一次手动重启后才会加载。
+- GitHub 已普通 fast-forward 发布到 `origin/main`，最新提交 `021dc8e`；release candidate manifest 119 项，validator=pass，未包含 runtime、缓存、日志、模型、私有状态或 evidence。
+- C 盘清理仍不能安全执行：活动 PID `22844/460` 是官方 Codex PID `20252` 的 MCP Headroom 子进程，仍从 `C:\Users\ma dao\.headroom-venv` 运行。当前不能终止官方子进程或删除其目录；需用户退出官方 Codex 后再执行迁移/删除并重启验证。
+- 因 synthetic 测试发生在新修复加载前，当前监视器暂时显示 `token-accounting.incomplete` 黄色；这不是 Kompress/504 故障，下一次重启必须重新建立干净 token 基线。
+
+证据：`evidence/p72-boundary-closure-20260816.json`。作者：Codex，2026-08-16。
