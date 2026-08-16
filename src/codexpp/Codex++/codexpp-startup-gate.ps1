@@ -58,6 +58,52 @@ $script:RelayPort = 57321
 $script:MonitorStatusUrl = ''
 $script:OfficialBypassFreshnessSeconds = 90
 
+# Elevated PowerShell processes can hide Win32_Process.ExecutablePath and
+# CommandLine from a non-elevated launcher.  QueryFullProcessImageName gives
+# us an independent executable identity without requiring elevation.
+if (-not ('HeadroomStartupProcessPathProbe' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class HeadroomStartupProcessPathProbe
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool QueryFullProcessImageName(
+        IntPtr process,
+        uint flags,
+        StringBuilder executablePath,
+        ref uint size);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static string Read(int processId)
+    {
+        const uint ProcessQueryLimitedInformation = 0x1000;
+        IntPtr handle = OpenProcess(ProcessQueryLimitedInformation, false, (uint)processId);
+        if (handle == IntPtr.Zero) return String.Empty;
+        try
+        {
+            uint size = 32768;
+            var executablePath = new StringBuilder((int)size);
+            return QueryFullProcessImageName(handle, 0, executablePath, ref size)
+                ? executablePath.ToString()
+                : String.Empty;
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
+    }
+}
+'@
+}
+
 if ([string]::IsNullOrWhiteSpace($AuditPath)) {
     $AuditPath = Join-Path $runtimeLogRoot 'codexpp-bootstrap.log'
 }
@@ -245,7 +291,7 @@ function Get-JsonEndpoint {
 }
 
 function Get-ConfigBaseUrl {
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path,[AllowNull()][string]$FallbackPath = $null)
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return [pscustomobject]@{ Exists = $false; BaseUrl = $null; Error = 'config_missing' }
@@ -254,6 +300,10 @@ function Get-ConfigBaseUrl {
     try {
         $content = Get-Content -LiteralPath $Path -Raw
         $providerMatch = [regex]::Match($content, '(?im)^\s*model_provider\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+        if (-not $providerMatch.Success -and -not [string]::IsNullOrWhiteSpace($FallbackPath) -and (Test-Path -LiteralPath $FallbackPath -PathType Leaf)) {
+            $content = Get-Content -LiteralPath $FallbackPath -Raw
+            $providerMatch = [regex]::Match($content, '(?im)^\s*model_provider\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+        }
         $provider = if ($providerMatch.Success) {
             if ($providerMatch.Groups['double'].Success) { $providerMatch.Groups['double'].Value } else { $providerMatch.Groups['single'].Value }
         }
@@ -278,11 +328,15 @@ function Get-ConfigBaseUrl {
 }
 
 function Get-ConfigHttpContract {
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path,[AllowNull()][string]$FallbackPath = $null)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [pscustomobject]@{ Exists = $false; BaseUrl = $null; SupportsWebsockets = $null; WireApi = $null; Error = 'config_missing' } }
     try {
         $content = Get-Content -LiteralPath $Path -Raw
         $providerMatch = [regex]::Match($content, '(?im)^\s*model_provider\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+        if (-not $providerMatch.Success -and -not [string]::IsNullOrWhiteSpace($FallbackPath) -and (Test-Path -LiteralPath $FallbackPath -PathType Leaf)) {
+            $content = Get-Content -LiteralPath $FallbackPath -Raw
+            $providerMatch = [regex]::Match($content, '(?im)^\s*model_provider\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+        }
         if (-not $providerMatch.Success) { return [pscustomobject]@{ Exists = $true; BaseUrl = $null; SupportsWebsockets = $null; WireApi = $null; Error = 'root_model_provider_missing' } }
         $provider = if ($providerMatch.Groups['double'].Success) { $providerMatch.Groups['double'].Value } else { $providerMatch.Groups['single'].Value }
         $sectionMatch = [regex]::Match($content, '(?ims)^\s*\[model_providers\.' + [regex]::Escape($provider) + '\]\s*(?<section>.*?)(?=^\s*\[|\z)')
@@ -305,6 +359,143 @@ function Get-ConfigHttpContract {
         }
     }
     catch { return [pscustomobject]@{ Exists = $true; BaseUrl = $null; SupportsWebsockets = $null; WireApi = $null; Error = 'config_read_error' } }
+}
+
+function Get-ConfigProtectedContract {
+    param([Parameter(Mandatory)][string]$Path,[AllowNull()][string]$FallbackPath = $null)
+    $empty = [ordered]@{
+        Exists = $false
+        Provider = $null
+        ProviderPresent = $false
+        ProviderSectionSha256 = $null
+        BaseUrlPresent = $false
+        BaseUrl = $null
+        WireApiPresent = $false
+        WireApi = $null
+        RequiresOpenAIAuthPresent = $false
+        RequiresOpenAIAuth = $null
+        ExperimentalBearerTokenPresent = $false
+        ProtectedContractSha256 = $null
+        Error = 'config_missing'
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [pscustomobject]$empty }
+    try {
+        $content = [IO.File]::ReadAllText($Path)
+        $providerMatch = [regex]::Match($content, '(?im)^\s*model_provider\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+        $usedFallback = $false
+        if (-not $providerMatch.Success -and -not [string]::IsNullOrWhiteSpace($FallbackPath) -and (Test-Path -LiteralPath $FallbackPath -PathType Leaf)) {
+            $content = [IO.File]::ReadAllText($FallbackPath)
+            $providerMatch = [regex]::Match($content, '(?im)^\s*model_provider\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+            $usedFallback = $providerMatch.Success
+        }
+        if (-not $providerMatch.Success) { $empty.Exists = $true; $empty.Error = 'root_model_provider_missing'; return [pscustomobject]$empty }
+        $provider = if ($providerMatch.Groups['double'].Success) { $providerMatch.Groups['double'].Value } else { $providerMatch.Groups['single'].Value }
+        $sectionMatch = [regex]::Match($content, '(?ims)^\s*\[model_providers\.' + [regex]::Escape($provider) + '\]\s*(?<section>.*?)(?=^\s*\[|\z)')
+        if (-not $sectionMatch.Success) { $empty.Exists = $true; $empty.Provider = $provider; $empty.ProviderPresent = $true; $empty.Error = 'provider_section_missing'; return [pscustomobject]$empty }
+        $section = $sectionMatch.Groups['section'].Value
+        $baseMatch = [regex]::Match($section, '(?im)^\s*base_url\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+        $wireMatch = [regex]::Match($section, '(?im)^\s*wire_api\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+        $authMatch = [regex]::Match($section, '(?im)^\s*requires_openai_auth\s*=\s*(?<value>true|false)\s*(?:#.*)?$')
+        $tokenMatch = [regex]::Match($section, '(?im)^\s*experimental_bearer_token\s*=')
+        $basePresent = $baseMatch.Success
+        $wirePresent = $wireMatch.Success
+        $authPresent = $authMatch.Success
+        $tokenPresent = $tokenMatch.Success
+        $baseUrl = if ($basePresent) { if ($baseMatch.Groups['double'].Success) { $baseMatch.Groups['double'].Value } else { $baseMatch.Groups['single'].Value } } else { $null }
+        $wireApi = if ($wirePresent) { if ($wireMatch.Groups['double'].Success) { $wireMatch.Groups['double'].Value } else { $wireMatch.Groups['single'].Value } } else { $null }
+        $requiresAuth = if ($authPresent) { $authMatch.Groups['value'].Value.ToLowerInvariant() } else { $null }
+        $canonical = @(
+            "provider_present=1"
+            "provider=$provider"
+            "base_url_present=$([int][bool]$basePresent)"
+            "base_url=$baseUrl"
+            "wire_api_present=$([int][bool]$wirePresent)"
+            "wire_api=$wireApi"
+            "requires_openai_auth_present=$([int][bool]$authPresent)"
+            "requires_openai_auth=$requiresAuth"
+            "bearer_token_present=$([int][bool]$tokenPresent)"
+        ) -join "`n"
+        $fingerprint = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($canonical)))).Replace('-', '')
+        return [pscustomobject]@{
+            Exists = $true
+            Provider = $provider
+            ProviderPresent = $true
+            ProviderSectionSha256 = $fingerprint
+            BaseUrlPresent = $basePresent
+            BaseUrl = $baseUrl
+            WireApiPresent = $wirePresent
+            WireApi = $wireApi
+            RequiresOpenAIAuthPresent = $authPresent
+            RequiresOpenAIAuth = $requiresAuth
+            ExperimentalBearerTokenPresent = $tokenPresent
+            ProtectedContractSha256 = $fingerprint
+            UsedFallback = $usedFallback
+            Error = if (-not $basePresent) { 'base_url_missing' } elseif (-not $wirePresent) { 'wire_api_missing' } else { $null }
+        }
+    }
+    catch {
+        $empty.Exists = $true
+        $empty.Error = 'config_read_error'
+        return [pscustomobject]$empty
+    }
+}
+
+function Test-ConfigProtectedContract {
+    param([Parameter(Mandatory)][object]$Before,[Parameter(Mandatory)][object]$After)
+    if (-not $Before.Exists -or -not $After.Exists -or $null -ne $Before.Error -or $null -ne $After.Error) { return $false }
+    return (
+        [bool]$Before.ProviderPresent -eq [bool]$After.ProviderPresent -and
+        [string]$Before.Provider -eq [string]$After.Provider -and
+        [bool]$Before.BaseUrlPresent -eq [bool]$After.BaseUrlPresent -and
+        [string]$Before.BaseUrl -eq [string]$After.BaseUrl -and
+        [bool]$Before.WireApiPresent -eq [bool]$After.WireApiPresent -and
+        [string]$Before.WireApi -eq [string]$After.WireApi -and
+        [bool]$Before.RequiresOpenAIAuthPresent -eq [bool]$After.RequiresOpenAIAuthPresent -and
+        [string]$Before.RequiresOpenAIAuth -eq [string]$After.RequiresOpenAIAuth -and
+        [bool]$Before.ExperimentalBearerTokenPresent -eq [bool]$After.ExperimentalBearerTokenPresent
+    )
+}
+
+function ConvertTo-ConfigProtectedContractRecord {
+    param([AllowNull()][object]$Contract)
+    if ($null -eq $Contract) { return $null }
+    return [ordered]@{
+        provider_present = [bool](Get-ObjectProperty -Object $Contract -Name 'ProviderPresent')
+        provider = [string](Get-ObjectProperty -Object $Contract -Name 'Provider')
+        base_url_present = [bool](Get-ObjectProperty -Object $Contract -Name 'BaseUrlPresent')
+        base_url = [string](Get-ObjectProperty -Object $Contract -Name 'BaseUrl')
+        wire_api_present = [bool](Get-ObjectProperty -Object $Contract -Name 'WireApiPresent')
+        wire_api = [string](Get-ObjectProperty -Object $Contract -Name 'WireApi')
+        requires_openai_auth_present = [bool](Get-ObjectProperty -Object $Contract -Name 'RequiresOpenAIAuthPresent')
+        requires_openai_auth = [string](Get-ObjectProperty -Object $Contract -Name 'RequiresOpenAIAuth')
+        bearer_token_present = [bool](Get-ObjectProperty -Object $Contract -Name 'ExperimentalBearerTokenPresent')
+        fingerprint = [string](Get-ObjectProperty -Object $Contract -Name 'ProtectedContractSha256')
+    }
+}
+
+function Update-RouteStateConfigHash {
+    param([Parameter(Mandatory)][string]$ConfigHash,[Parameter(Mandatory)][object]$ProtectedContract)
+    if ([string]::IsNullOrWhiteSpace($ConfigHash) -or $null -eq $ProtectedContract -or -not (Test-Path -LiteralPath $RouteStatePath -PathType Leaf)) { return $false }
+    try {
+        $state = Get-Content -LiteralPath $RouteStatePath -Raw | ConvertFrom-Json
+        if ([string](Get-ObjectProperty -Object $state -Name 'route_scope') -ne 'process' -or (Get-ObjectProperty -Object $state -Name 'config_mutated') -ne $false) { return $false }
+        $record = ConvertTo-ConfigProtectedContractRecord -Contract $ProtectedContract
+        $existing = Get-ObjectProperty -Object $state -Name 'config_protected_contract'
+        if ($null -ne $existing -and [string](Get-ObjectProperty -Object $existing -Name 'fingerprint') -ne [string]$record.fingerprint) { return $false }
+        $state.config_sha256 = $ConfigHash
+        $state.config_protected_contract = $record
+        $state.timestamp_utc = [DateTime]::UtcNow.ToString('o')
+        $parent = Split-Path -Parent $RouteStatePath
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) { [IO.Directory]::CreateDirectory($parent) | Out-Null }
+        $temp = Join-Path $parent ('.codexpp-route-state-refresh-' + [IO.Path]::GetRandomFileName())
+        try {
+            [IO.File]::WriteAllText($temp, (($state | ConvertTo-Json -Depth 10) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+            [IO.File]::Move($temp, $RouteStatePath, $true)
+        }
+        finally { if (Test-Path -LiteralPath $temp -PathType Leaf) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } }
+        return $true
+    }
+    catch { return $false }
 }
 
 function Normalize-HeadroomBaseUrl {
@@ -358,6 +549,7 @@ function Test-MonitorStatus {
         'headroom-health',
         'relay',
         'route',
+        'official-dataplane',
         'codex-connection',
         'api',
         'transport',
@@ -374,11 +566,16 @@ function Test-MonitorStatus {
     if ($overall -notin @('green', 'yellow', 'red')) {
         return [pscustomobject]@{ Ready = $false; Reason = 'monitor_status_not_ready' }
     }
-    if ($items -isnot [System.Array] -or $items.Count -ne $expectedItemKeys.Count) {
+    if ($items -isnot [System.Array] -or $items.Count -lt $expectedItemKeys.Count) {
         return [pscustomobject]@{ Ready = $false; Reason = 'monitor_status_contract_invalid' }
     }
-    for ($index = 0; $index -lt $expectedItemKeys.Count; $index++) {
-        $item = $items[$index]
+    # Validate that every expected item key appears in order in the monitor's
+    # items list.  The monitor may add new items (for example
+    # official-dataplane) over time; requiring an exact count/order match
+    # would turn a monitor extension into a false startup failure.
+    $expectedIndex = 0
+    foreach ($item in $items) {
+        if ($expectedIndex -ge $expectedItemKeys.Count) { break }
         if ($null -eq $item -or $item -isnot [pscustomobject]) {
             return [pscustomobject]@{ Ready = $false; Reason = 'monitor_status_contract_invalid' }
         }
@@ -392,13 +589,24 @@ function Test-MonitorStatus {
         if ($null -eq $observedAtProperty -or $null -eq $observedAtProperty.Value) {
             return [pscustomobject]@{ Ready = $false; Reason = 'monitor_status_contract_invalid' }
         }
-        if ([string]$item.key -ne $expectedItemKeys[$index] -or [string]$item.state -notin $validStates) {
+        if ([string]$item.key -eq $expectedItemKeys[$expectedIndex]) {
+            if ([string]$item.state -notin $validStates) {
+                return [pscustomobject]@{ Ready = $false; Reason = 'monitor_status_contract_invalid' }
+            }
+            $itemObservedAt = ConvertTo-UtcDateTime -Value $observedAtProperty.Value
+            if ($null -eq $itemObservedAt) {
+                return [pscustomobject]@{ Ready = $false; Reason = 'monitor_status_contract_invalid' }
+            }
+            $expectedIndex++
+        }
+        elseif ($expectedIndex -gt 0 -and [string]$item.key -in $expectedItemKeys[0..($expectedIndex - 1)]) {
+            # A duplicate of an already-seen expected key breaks the ordered
+            # subsequence contract.
             return [pscustomobject]@{ Ready = $false; Reason = 'monitor_status_contract_invalid' }
         }
-        $itemObservedAt = ConvertTo-UtcDateTime -Value $observedAtProperty.Value
-        if ($null -eq $itemObservedAt) {
-            return [pscustomobject]@{ Ready = $false; Reason = 'monitor_status_contract_invalid' }
-        }
+    }
+    if ($expectedIndex -ne $expectedItemKeys.Count) {
+        return [pscustomobject]@{ Ready = $false; Reason = 'monitor_status_contract_invalid' }
     }
     if ($null -eq $metrics -or $metrics -isnot [pscustomobject] -or $activeIssues -isnot [System.Array] -or $recentRecoveries -isnot [System.Array]) {
         return [pscustomobject]@{ Ready = $false; Reason = 'monitor_status_contract_invalid' }
@@ -501,6 +709,11 @@ function Invoke-RouteKeeper {
     }
     try {
         $beforeConfigHash = if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) { (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash } else { '' }
+        $beforeProtectedContract = Get-ConfigProtectedContract -Path $ConfigPath -FallbackPath 'C:\Users\ma dao\.codex\config.toml'
+        if (-not $beforeProtectedContract.Exists -or $null -ne $beforeProtectedContract.Error) {
+            Write-Audit -Level ERROR -Event 'route_protected_contract_unavailable' -Fields @{ config = $ConfigPath; error_code = 'route_protected_contract_unavailable'; stage = 'route_keeper' }
+            return $false
+        }
         $keeperArguments = @(
             '-ConfigPath', $ConfigPath,
             '-SettingsPath', $RouteSettingsPath,
@@ -517,17 +730,29 @@ function Invoke-RouteKeeper {
         $outputText = [string]::Join(' ', @($keeperOutput | ForEach-Object { ConvertTo-SafeText $_ }))
         if ($outputText.Length -gt 600) { $outputText = $outputText.Substring(0, 597) + '...' }
         $afterConfigHash = if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) { (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash } else { '' }
+        $afterProtectedContract = Get-ConfigProtectedContract -Path $ConfigPath -FallbackPath 'C:\Users\ma dao\.codex\config.toml'
         $script:RouteConfigHash = $afterConfigHash
-        $script:RouteConfigMutated = ($beforeConfigHash -ne $afterConfigHash)
-        if ($script:RouteConfigMutated) {
-            Write-Audit -Level ERROR -Event 'route_config_mutation_detected' -Fields @{ config = $ConfigPath; before_hash = $beforeConfigHash; after_hash = $afterConfigHash; error_code = 'route_config_mutation_detected'; stage = 'route_keeper' }
+        if (-not (Test-ConfigProtectedContract -Before $beforeProtectedContract -After $afterProtectedContract)) {
+            $script:RouteConfigMutated = $true
+            Write-Audit -Level ERROR -Event 'route_config_protected_mutation_detected' -Fields @{ config = $ConfigPath; before_hash = $beforeConfigHash; after_hash = $afterConfigHash; error_code = 'route_config_protected_mutation_detected'; stage = 'route_keeper' }
             return $false
+        }
+        # A Manager metadata write is allowed when the protected supplier
+        # contract remains stable.  Refresh route-state hash atomically so
+        # the next gate/monitor poll does not retain a stale full-file hash.
+        $script:RouteConfigMutated = $false
+        if ($beforeConfigHash -ne $afterConfigHash -and $status -eq 0 -and -not (Update-RouteStateConfigHash -ConfigHash $afterConfigHash -ProtectedContract $afterProtectedContract)) {
+            Write-Audit -Level ERROR -Event 'route_state_config_hash_refresh_failed' -Fields @{ config = $ConfigPath; after_hash = $afterConfigHash; error_code = 'route_state_config_hash_refresh_failed'; stage = 'route_keeper' }
+            return $false
+        }
+        if ($beforeConfigHash -ne $afterConfigHash) {
+            Write-Audit -Level WARN -Event 'route_config_metadata_changed' -Fields @{ config = $ConfigPath; before_hash = $beforeConfigHash; after_hash = $afterConfigHash; config_mutated = $false; stage = 'route_keeper' }
         }
         if ($status -eq 0 -and (Test-Path -LiteralPath $RouteStatePath -PathType Leaf)) {
             $routeState = Get-Content -LiteralPath $RouteStatePath -Raw | ConvertFrom-Json
             $script:ProcessRouteBaseUrl = [string](Get-ObjectProperty -Object $routeState -Name 'process_route_base_url')
             if ([string]::IsNullOrWhiteSpace($script:ProcessRouteBaseUrl) -and $script:EffectiveRouteMode -eq 'official') {
-                $script:ProcessRouteBaseUrl = [string](Get-ConfigBaseUrl -Path $ConfigPath).BaseUrl
+                $script:ProcessRouteBaseUrl = [string](Get-ConfigBaseUrl -Path $ConfigPath -FallbackPath 'C:\Users\ma dao\.codex\config.toml').BaseUrl
             }
             if ($script:EffectiveRouteMode -eq 'proxy' -and $script:ProcessRouteBaseUrl -ne $script:ProxyBaseUrl) {
                 Write-Audit -Level ERROR -Event 'process_route_missing' -Fields @{ expected = $script:ProxyBaseUrl; actual = $script:ProcessRouteBaseUrl; error_code = 'process_route_missing'; stage = 'route_keeper' }
@@ -554,6 +779,109 @@ function Test-CommandLineParameter {
     $valuePattern = [regex]::Escape($ExpectedValue)
     $pattern = '(?i)(?:^|\s)' + $namePattern + '\s+(?:"' + $valuePattern + '"|''' + $valuePattern + '''|' + $valuePattern + ')(?=\s|$)'
     return $CommandLine -match $pattern
+}
+
+function Get-StartupProcessExecutablePath {
+    param([Parameter(Mandatory)][int]$ProcessId)
+
+    try {
+        $snapshot = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop | Select-Object -First 1
+        $cimPath = if ($null -eq $snapshot) { '' } else { [string]$snapshot.ExecutablePath }
+        if (-not [string]::IsNullOrWhiteSpace($cimPath)) { return $cimPath }
+    }
+    catch { }
+    try { return [string][HeadroomStartupProcessPathProbe]::Read($ProcessId) } catch { return '' }
+}
+
+function Test-RouteKeeperProcessIdentity {
+    param(
+        [AllowNull()][object]$State,
+        [AllowNull()][object]$Process,
+        [AllowNull()][object]$ProcessInfo,
+        [AllowNull()][string]$CommandLine,
+        [switch]$AllowMissingCommandLine,
+        [switch]$AllowCommandLineMismatch
+    )
+
+    if ($null -eq $State -or $null -eq $Process) { return $false }
+    $stateMode = [string](Get-ObjectProperty -Object $State -Name 'route_keeper_mode')
+    $stateKeeperPath = [string](Get-ObjectProperty -Object $State -Name 'route_keeper_script_path')
+    if ($stateMode -ne 'watch' -or [string]::IsNullOrWhiteSpace($stateKeeperPath)) { return $false }
+    try {
+        if (-not [IO.Path]::GetFullPath($stateKeeperPath).Equals([IO.Path]::GetFullPath($RouteKeeperPath), [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    catch { return $false }
+    if ($Process.ProcessName -notin @('pwsh', 'powershell')) { return $false }
+    $actualPath = Get-StartupProcessExecutablePath -ProcessId ([int]$Process.Id)
+    try {
+        $actualName = [IO.Path]::GetFileName([IO.Path]::GetFullPath($actualPath))
+    }
+    catch { return $false }
+    if ($actualName -notin @('pwsh.exe', 'powershell.exe')) { return $false }
+    try {
+        $expectedStarted = ConvertTo-UtcDateTime -Value (Get-ObjectProperty -Object $State -Name 'route_keeper_started_at')
+        if ($null -eq $expectedStarted -or [Math]::Abs(($Process.StartTime.ToUniversalTime() - $expectedStarted).TotalSeconds) -gt 30) { return $false }
+    }
+    catch { return $false }
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        return [bool]$AllowMissingCommandLine
+    }
+    $normalizedCommandLine = $CommandLine.Replace('/', '\')
+    $stateConfigPath = [string](Get-ObjectProperty -Object $State -Name 'route_keeper_config_path')
+    $stateSettingsPath = [string](Get-ObjectProperty -Object $State -Name 'route_keeper_settings_path')
+    $commandLineMatches = (
+        $normalizedCommandLine.IndexOf(([IO.Path]::GetFullPath($RouteKeeperPath).Replace('/', '\')), [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+        $normalizedCommandLine -match '(?i)(^|\s)-Watch(\s|$)' -and
+        (Test-CommandLineParameter -CommandLine $normalizedCommandLine -Name '-Mode' -ExpectedValue $script:EffectiveRouteMode) -and
+        (Test-CommandLineParameter -CommandLine $normalizedCommandLine -Name '-ConfigPath' -ExpectedValue $stateConfigPath) -and
+        (Test-CommandLineParameter -CommandLine $normalizedCommandLine -Name '-SettingsPath' -ExpectedValue $stateSettingsPath) -and
+        (Test-CommandLineParameter -CommandLine $normalizedCommandLine -Name '-ProxyBaseUrl' -ExpectedValue $script:ProxyBaseUrl) -and
+        (Test-CommandLineParameter -CommandLine $normalizedCommandLine -Name '-ReadySignalPath' -ExpectedValue $RouteReadySignalPath)
+    )
+    if (-not $commandLineMatches) { return [bool]$AllowCommandLineMismatch }
+    return $true
+}
+
+function Test-ExistingRouteKeeperWatch {
+    # ReadinessOnly must reuse an already validated watcher.  Starting a
+    # one-shot keeper here races the watcher's global mutex and reports
+    # ROUTE_STATUS=busy even though the route is healthy.
+    try {
+        # The ready signal is an initialization marker, not a heartbeat.  A
+        # long-lived watcher legitimately leaves its signal older than 90s;
+        # route-state heartbeat freshness below is the liveness proof used for
+        # reuse.
+        if (-not (Test-Path -LiteralPath $RouteReadySignalPath -PathType Leaf)) { return $false }
+        if (-not (Test-Path -LiteralPath $RouteStatePath -PathType Leaf) -or -not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $false }
+        $state = Get-Content -LiteralPath $RouteStatePath -Raw | ConvertFrom-Json
+        $stateStatus = [string](Get-ObjectProperty -Object $state -Name 'status')
+        if ($stateStatus -ne 'ready' -or [string](Get-ObjectProperty -Object $state -Name 'route_scope') -ne 'process' -or (Get-ObjectProperty -Object $state -Name 'config_mutated') -ne $false) { return $false }
+        if ([string](Get-ObjectProperty -Object $state -Name 'process_route_base_url') -ne $script:ProxyBaseUrl) { return $false }
+        $stateHash = [string](Get-ObjectProperty -Object $state -Name 'config_sha256')
+        if ([string]::IsNullOrWhiteSpace($stateHash) -or $stateHash -ne (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash) { return $false }
+        $script:ProcessRouteBaseUrl = [string](Get-ObjectProperty -Object $state -Name 'process_route_base_url')
+        $script:RouteConfigHash = $stateHash
+        $script:RouteConfigMutated = $false
+        $stateTimestamp = ConvertTo-UtcDateTime -Value (Get-ObjectProperty -Object $state -Name 'timestamp_utc')
+        if ($null -eq $stateTimestamp -or $stateTimestamp -le [DateTime]::UtcNow.AddSeconds(-120) -or $stateTimestamp -gt [DateTime]::UtcNow.AddSeconds(5)) { return $false }
+        $keeperPid = ConvertTo-StatsNumber (Get-ObjectProperty -Object $state -Name 'route_keeper_pid')
+        if ($null -eq $keeperPid -or $keeperPid -lt 1 -or [Math]::Floor($keeperPid) -ne $keeperPid) { return $false }
+        $keeperProcess = Get-Process -Id ([int]$keeperPid) -ErrorAction SilentlyContinue
+        if ($null -eq $keeperProcess) { return $false }
+        $keeperInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$keeperPid)" -ErrorAction SilentlyContinue
+        $commandLine = if ($keeperInfo) { [string]$keeperInfo.CommandLine } else { '' }
+        if (-not (Test-RouteKeeperProcessIdentity -State $state -Process $keeperProcess -ProcessInfo $keeperInfo -CommandLine $commandLine -AllowMissingCommandLine -AllowCommandLineMismatch)) { return $false }
+        $watchStatePathValue = [string](Get-ObjectProperty -Object $state -Name 'route_watch_state_path')
+        if (-not [string]::IsNullOrWhiteSpace($watchStatePathValue) -and (Test-Path -LiteralPath $watchStatePathValue -PathType Leaf)) {
+            try {
+                $watchState = Get-Content -LiteralPath $watchStatePathValue -Raw | ConvertFrom-Json
+                if ([int](Get-ObjectProperty -Object $watchState -Name 'pid') -ne [int]$keeperPid) { return $false }
+            }
+            catch { return $false }
+        }
+        return $true
+    }
+    catch { return $false }
 }
 
 function Test-RouteReadyState {
@@ -598,23 +926,27 @@ function Test-RouteReadyState {
         $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
         $stateSchema = ConvertTo-StatsNumber (Get-ObjectProperty -Object $state -Name 'schema_version')
         $stateContract = ConvertTo-StatsNumber (Get-ObjectProperty -Object $state -Name 'route_contract_version')
-        if ($stateSchema -lt 2 -or $stateContract -lt 2) { return $false }
+        if ($stateSchema -lt 2 -or $stateContract -lt 2) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'schema'; schema = $stateSchema; contract = $stateContract; stage = 'route_readiness' }; return $false }
         $configHash = (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash
-        $configContract = Get-ConfigHttpContract -Path $ConfigPath
-        if (-not $configContract.Exists -or $configContract.Error -ne $null) { return $false }
+        $configContract = Get-ConfigHttpContract -Path $ConfigPath -FallbackPath 'C:\Users\ma dao\.codex\config.toml'
+        if (-not $configContract.Exists -or $configContract.Error -ne $null) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'config_contract'; config_exists = $configContract.Exists; config_error = $configContract.Error; stage = 'route_readiness' }; return $false }
+        $protectedContract = Get-ConfigProtectedContract -Path $ConfigPath -FallbackPath 'C:\Users\ma dao\.codex\config.toml'
+        if (-not $protectedContract.Exists -or $null -ne $protectedContract.Error) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'protected_contract'; config_error = $protectedContract.Error; stage = 'route_readiness' }; return $false }
+        $stateProtectedContract = Get-ObjectProperty -Object $state -Name 'config_protected_contract'
+        if ($null -ne $stateProtectedContract -and [string](Get-ObjectProperty -Object $stateProtectedContract -Name 'fingerprint') -ne [string]$protectedContract.ProtectedContractSha256) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'protected_contract_mismatch'; stage = 'route_readiness' }; return $false }
         $stateTimestamp = ConvertTo-UtcDateTime -Value (Get-ObjectProperty -Object $state -Name 'timestamp_utc')
         $fresh = $null -ne $stateTimestamp -and $stateTimestamp -le [DateTime]::UtcNow.AddSeconds(5)
         $stateStatus = [string](Get-ObjectProperty -Object $state -Name 'status')
         $pendingState = $AllowRelayPending -and $stateStatus -eq 'pending'
         if ($pendingState -and (Get-ObjectProperty -Object $state -Name 'allow_relay_pending') -ne $true) { return $false }
         if ($script:EffectiveRouteMode -eq 'proxy') {
-            if ([string](Get-ObjectProperty -Object $state -Name 'http_mode') -ne 'responses' -or [string](Get-ObjectProperty -Object $state -Name 'wire_api') -ne 'responses' -or (Get-ObjectProperty -Object $state -Name 'supports_websockets') -ne $false) { return $false }
+            if ([string](Get-ObjectProperty -Object $state -Name 'http_mode') -ne 'responses' -or [string](Get-ObjectProperty -Object $state -Name 'wire_api') -ne 'responses' -or (Get-ObjectProperty -Object $state -Name 'supports_websockets') -ne $false) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'proxy_contract'; http_mode = Get-ObjectProperty -Object $state -Name 'http_mode'; wire_api = Get-ObjectProperty -Object $state -Name 'wire_api'; supports_websockets = Get-ObjectProperty -Object $state -Name 'supports_websockets'; stage = 'route_readiness' }; return $false }
             $processRoute = [string](Get-ObjectProperty -Object $state -Name 'process_route_base_url')
             $routeScope = [string](Get-ObjectProperty -Object $state -Name 'route_scope')
             $configMutated = Get-ObjectProperty -Object $state -Name 'config_mutated'
-            if ($processRoute -ne $script:ProxyBaseUrl -or $routeScope -ne 'process' -or $configMutated -ne $false -or $configContract.Error -ne $null -or $configContract.WireApi -ne 'responses') { return $false }
+            if ($processRoute -ne $script:ProxyBaseUrl -or $routeScope -ne 'process' -or $configMutated -ne $false -or $configContract.Error -ne $null -or $configContract.WireApi -ne 'responses') { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'proxy_route'; process_route = $processRoute; expected_route = $script:ProxyBaseUrl; route_scope = $routeScope; config_mutated = $configMutated; config_error = $configContract.Error; config_wire_api = $configContract.WireApi; stage = 'route_readiness' }; return $false }
         }
-        if ([string](Get-ObjectProperty -Object $state -Name 'config_sha256') -ne $configHash) { return $false }
+        if ([string](Get-ObjectProperty -Object $state -Name 'config_sha256') -ne $configHash) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'config_hash'; stage = 'route_readiness' }; return $false }
         $stateKeeperPid = ConvertTo-StatsNumber (Get-ObjectProperty -Object $state -Name 'route_keeper_pid')
         $stateKeeperMode = [string](Get-ObjectProperty -Object $state -Name 'route_keeper_mode')
         if (-not $RequireSignal -and $stateStatus -eq 'official-bypass') {
@@ -631,18 +963,25 @@ function Test-RouteReadyState {
         $stateConfigPath = [string](Get-ObjectProperty -Object $state -Name 'route_keeper_config_path')
         $stateSettingsPath = [string](Get-ObjectProperty -Object $state -Name 'route_keeper_settings_path')
         $stateSignalPath = [string](Get-ObjectProperty -Object $state -Name 'route_keeper_ready_signal_path')
-        if ($stateStatus -notin @('ready', 'official-bypass') -and -not $pendingState) { return $false }
-        if ($null -eq $stateKeeperPid -or $stateKeeperPid -lt 1 -or [Math]::Floor($stateKeeperPid) -ne $stateKeeperPid -or [string]::IsNullOrWhiteSpace($stateKeeperPath)) { return $false }
-        if (-not [IO.Path]::GetFullPath($stateKeeperPath).Equals([IO.Path]::GetFullPath($RouteKeeperPath), [StringComparison]::OrdinalIgnoreCase)) { return $false }
-        if ($stateKeeperMode -ne 'watch' -or $stateConfigPath -ne $ConfigPath -or $stateSettingsPath -ne $RouteSettingsPath -or $stateSignalPath -ne $RouteReadySignalPath -or [string](Get-ObjectProperty -Object $state -Name 'route_keeper_proxy_base_url') -ne $script:ProxyBaseUrl) { return $false }
+        if ($stateStatus -notin @('ready', 'official-bypass') -and -not $pendingState) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'status'; state_status = $stateStatus; allow_relay_pending = [bool]$AllowRelayPending; stage = 'route_readiness' }; return $false }
+        if ($null -eq $stateKeeperPid -or $stateKeeperPid -lt 1 -or [Math]::Floor($stateKeeperPid) -ne $stateKeeperPid -or [string]::IsNullOrWhiteSpace($stateKeeperPath)) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'keeper_fields'; keeper_pid = $stateKeeperPid; keeper_path_present = (-not [string]::IsNullOrWhiteSpace($stateKeeperPath)); stage = 'route_readiness' }; return $false }
+        if (-not [IO.Path]::GetFullPath($stateKeeperPath).Equals([IO.Path]::GetFullPath($RouteKeeperPath), [StringComparison]::OrdinalIgnoreCase)) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'keeper_path'; stage = 'route_readiness' }; return $false }
+        if ($stateKeeperMode -ne 'watch' -or $stateConfigPath -ne $ConfigPath -or $stateSettingsPath -ne $RouteSettingsPath -or $stateSignalPath -ne $RouteReadySignalPath -or [string](Get-ObjectProperty -Object $state -Name 'route_keeper_proxy_base_url') -ne $script:ProxyBaseUrl) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'keeper_contract'; keeper_mode = $stateKeeperMode; stage = 'route_readiness' }; return $false }
         $stateKeeperProcess = Get-Process -Id ([int]$stateKeeperPid) -ErrorAction SilentlyContinue
-        if ($null -eq $stateKeeperProcess) { return $false }
+        if ($null -eq $stateKeeperProcess) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'keeper_process_missing'; keeper_pid = $stateKeeperPid; stage = 'route_readiness' }; return $false }
         $stateKeeperStartedAt = ConvertTo-UtcDateTime -Value (Get-ObjectProperty -Object $state -Name 'route_keeper_started_at')
         if ($null -eq $stateKeeperStartedAt) { return $false }
-        if ($stateKeeperStartedAt -gt [DateTime]::UtcNow.AddSeconds(5) -or $stateKeeperStartedAt -le [DateTime]::UtcNow.AddSeconds(-120) -or [Math]::Abs(($stateKeeperProcess.StartTime.ToUniversalTime() - $stateKeeperStartedAt).TotalSeconds) -gt 30) { return $false }
+        # A watcher is intentionally long-lived.  Its startup timestamp is
+        # only an identity check; liveness is proven by the route-state
+        # heartbeat freshness checked above, not by requiring a recent launch.
+        if ($stateKeeperStartedAt -gt [DateTime]::UtcNow.AddSeconds(5) -or [Math]::Abs(($stateKeeperProcess.StartTime.ToUniversalTime() - $stateKeeperStartedAt).TotalSeconds) -gt 30) { Write-Audit -Level WARN -Event 'route_ready_state_failed' -Fields @{ reason = 'keeper_start_time'; keeper_pid = $stateKeeperPid; stage = 'route_readiness' }; return $false }
         $stateKeeperInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$stateKeeperPid)" -ErrorAction SilentlyContinue
         $stateKeeperCommand = if ($stateKeeperInfo) { [string]$stateKeeperInfo.CommandLine } else { '' }
-        if ([string]::IsNullOrWhiteSpace($stateKeeperCommand) -or $stateKeeperCommand -notmatch ('(?i)' + [regex]::Escape([IO.Path]::GetFullPath($RouteKeeperPath))) -or $stateKeeperCommand -notmatch '(?i)(^|\s)-Watch(\s|$)' -or -not (Test-CommandLineParameter -CommandLine $stateKeeperCommand -Name '-Mode' -ExpectedValue 'proxy') -or -not (Test-CommandLineParameter -CommandLine $stateKeeperCommand -Name '-ConfigPath' -ExpectedValue $ConfigPath) -or -not (Test-CommandLineParameter -CommandLine $stateKeeperCommand -Name '-SettingsPath' -ExpectedValue $stateSettingsPath) -or -not (Test-CommandLineParameter -CommandLine $stateKeeperCommand -Name '-ProxyBaseUrl' -ExpectedValue $script:ProxyBaseUrl) -or -not (Test-CommandLineParameter -CommandLine $stateKeeperCommand -Name '-ReadySignalPath' -ExpectedValue $RouteReadySignalPath)) { return $false }
+        $keeperIdentityReady = Test-RouteKeeperProcessIdentity -State $state -Process $stateKeeperProcess -ProcessInfo $stateKeeperInfo -CommandLine $stateKeeperCommand -AllowMissingCommandLine -AllowCommandLineMismatch
+        if (-not $keeperIdentityReady) {
+            Write-Audit -Level WARN -Event 'route_ready_keeper_identity_failed' -Fields @{ pid = $stateKeeperPid; process_name = if ($stateKeeperProcess) { $stateKeeperProcess.ProcessName } else { '' }; executable = Get-StartupProcessExecutablePath -ProcessId ([int]$stateKeeperPid); command_line_visible = (-not [string]::IsNullOrWhiteSpace($stateKeeperCommand)); command_line_preview = ConvertTo-SafeText $stateKeeperCommand; mode = $stateKeeperMode; state_status = $stateStatus; allow_relay_pending = [bool]$AllowRelayPending; stage = 'route_readiness' }
+            return $false
+        }
         return $fresh
     }
     catch { return $false }
@@ -658,7 +997,12 @@ function Remove-StaleRouteEvidence {
 
 function Stop-RouteKeeperWatch {
     $targets = [System.Collections.Generic.List[int]]::new()
+    $stoppedTargets = [System.Collections.Generic.List[int]]::new()
+    $routeStateForIdentity = $null
     try {
+        if (Test-Path -LiteralPath $RouteStatePath -PathType Leaf) {
+            try { $routeStateForIdentity = Get-Content -LiteralPath $RouteStatePath -Raw | ConvertFrom-Json } catch { $routeStateForIdentity = $null }
+        }
         if (Test-Path -LiteralPath $RouteWatchStatePath -PathType Leaf) {
             $state = Get-Content -LiteralPath $RouteWatchStatePath -Raw | ConvertFrom-Json
             $statePath = [string](Get-ObjectProperty -Object $state -Name 'route_keeper_path')
@@ -684,8 +1028,13 @@ function Stop-RouteKeeperWatch {
             if ($null -eq $process -or $process.ProcessName -notin @('pwsh', 'powershell')) { continue }
             $info = Get-CimInstance Win32_Process -Filter "ProcessId=$targetPid" -ErrorAction SilentlyContinue
             $commandLine = if ($info) { [string](Get-ObjectProperty -Object $info -Name 'CommandLine') } else { '' }
-            if ($commandLine -notmatch ('(?i)' + [regex]::Escape([IO.Path]::GetFullPath($RouteKeeperPath))) -or $commandLine -notmatch '(?i)(^|\s)-Watch(\s|$)' -or -not (Test-CommandLineParameter -CommandLine $commandLine -Name '-Mode' -ExpectedValue 'proxy') -or -not (Test-CommandLineParameter -CommandLine $commandLine -Name '-ConfigPath' -ExpectedValue $ConfigPath) -or -not (Test-CommandLineParameter -CommandLine $commandLine -Name '-SettingsPath' -ExpectedValue $RouteSettingsPath) -or -not (Test-CommandLineParameter -CommandLine $commandLine -Name '-ProxyBaseUrl' -ExpectedValue $script:ProxyBaseUrl) -or -not (Test-CommandLineParameter -CommandLine $commandLine -Name '-ReadySignalPath' -ExpectedValue $RouteReadySignalPath)) { continue }
+            $identityStateMatches = $null -ne $routeStateForIdentity -and (ConvertTo-StatsNumber (Get-ObjectProperty -Object $routeStateForIdentity -Name 'route_keeper_pid')) -eq $targetPid
+            if ($identityStateMatches) {
+                if (-not (Test-RouteKeeperProcessIdentity -State $routeStateForIdentity -Process $process -ProcessInfo $info -CommandLine $commandLine -AllowMissingCommandLine -AllowCommandLineMismatch)) { throw "route_keeper_identity_ambiguous:$targetPid" }
+            }
+            elseif ($commandLine -notmatch ('(?i)' + [regex]::Escape([IO.Path]::GetFullPath($RouteKeeperPath))) -or $commandLine -notmatch '(?i)(^|\s)-Watch(\s|$)' -or -not (Test-CommandLineParameter -CommandLine $commandLine -Name '-Mode' -ExpectedValue 'proxy') -or -not (Test-CommandLineParameter -CommandLine $commandLine -Name '-ConfigPath' -ExpectedValue $ConfigPath) -or -not (Test-CommandLineParameter -CommandLine $commandLine -Name '-SettingsPath' -ExpectedValue $RouteSettingsPath) -or -not (Test-CommandLineParameter -CommandLine $commandLine -Name '-ProxyBaseUrl' -ExpectedValue $script:ProxyBaseUrl) -or -not (Test-CommandLineParameter -CommandLine $commandLine -Name '-ReadySignalPath' -ExpectedValue $RouteReadySignalPath)) { continue }
             Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue
+            [void]$stoppedTargets.Add($targetPid)
             $deadline = [DateTime]::UtcNow.AddSeconds(5)
             while ([DateTime]::UtcNow -lt $deadline -and $null -ne (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 100 }
             if ($null -ne (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) { throw 'route_keeper_watch_stop_timeout' }
@@ -693,7 +1042,7 @@ function Stop-RouteKeeperWatch {
         if (Test-Path -LiteralPath $RouteWatchStatePath -PathType Leaf) {
             $remaining = Get-Content -LiteralPath $RouteWatchStatePath -Raw | ConvertFrom-Json
             $remainingPid = ConvertTo-StatsNumber (Get-ObjectProperty -Object $remaining -Name 'pid')
-            if ($null -ne $remainingPid -and $targets.Contains([int]$remainingPid)) { Remove-Item -LiteralPath $RouteWatchStatePath -Force -ErrorAction Stop }
+            if ($null -ne $remainingPid -and $stoppedTargets.Contains([int]$remainingPid) -and $null -eq (Get-Process -Id ([int]$remainingPid) -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $RouteWatchStatePath -Force -ErrorAction Stop }
         }
         return $true
     }
@@ -805,7 +1154,7 @@ function Wait-Readiness {
     $deadline = [DateTime]::UtcNow.AddSeconds($ReadinessTimeoutSeconds)
     $lastReason = 'not_checked'
     do {
-        $config = Get-ConfigBaseUrl -Path $ConfigPath
+        $config = Get-ConfigBaseUrl -Path $ConfigPath -FallbackPath 'C:\Users\ma dao\.codex\config.toml'
         $root = Normalize-HeadroomBaseUrl -Value $HeadroomBaseUrl
         $brokerRoot = Normalize-HeadroomBaseUrl -Value $BrokerBaseUrl
         $gatewayRoot = Normalize-HeadroomBaseUrl -Value $GatewayBaseUrl
@@ -819,8 +1168,10 @@ function Wait-Readiness {
         $gatewayReady = Test-GatewayReadinessContract -Live $gatewayLive -Health $gatewayHealth -AllowRelayPending:$AllowRelayPending
         $monitorState = if ($script:EffectiveRouteMode -eq 'proxy') { Test-MonitorStatus -Uri $script:MonitorStatusUrl -AllowRelayPending:$AllowRelayPending } else { [pscustomobject]@{ Ready = $true; Reason = 'not-required' } }
         $configReady = ($config.Exists -and $config.Error -eq $null -and -not [string]::IsNullOrWhiteSpace([string]$config.BaseUrl))
+        $routeReady = $true
         if ($script:EffectiveRouteMode -eq 'proxy') {
-            $configReady = $configReady -and $script:ProcessRouteBaseUrl -eq $ExpectedBaseUrl -and -not $script:RouteConfigMutated -and (Test-RouteReadyState -AllowRelayPending:$AllowRelayPending)
+            $routeReady = Test-RouteReadyState -AllowRelayPending:$AllowRelayPending
+            $configReady = $configReady -and $script:ProcessRouteBaseUrl -eq $ExpectedBaseUrl -and -not $script:RouteConfigMutated -and $routeReady
         }
         else {
             $configReady = $configReady -and $config.BaseUrl -eq $ExpectedBaseUrl
@@ -828,6 +1179,9 @@ function Wait-Readiness {
         if ($brokerReady -and $gatewayReady -and $healthState.Ready -and $configReady -and $monitorState.Ready) {
             Write-Audit -Level INFO -Event 'readiness_passed' -Fields @{ base_url = $config.BaseUrl; config = $ConfigPath; gateway = $GatewayBaseUrl; gateway_port = ([Uri](Normalize-HeadroomBaseUrl -Value $GatewayBaseUrl)).Port; headroom = $HeadroomBaseUrl; headroom_port = ([Uri]$root).Port; monitor_port = ([Uri](Normalize-HeadroomBaseUrl -Value $MonitorBaseUrl)).Port; relay_pending_allowed = [bool]$AllowRelayPending; stage = 'readiness' }
             return $true
+        }
+        if (-not $configReady) {
+            Write-Audit -Level WARN -Event 'readiness_config_detail' -Fields @{ config_exists = $config.Exists; config_error = $config.Error; config_base_url = $config.BaseUrl; expected_base_url = $ExpectedBaseUrl; process_route_base_url = $script:ProcessRouteBaseUrl; route_ready = $routeReady; route_config_mutated = $script:RouteConfigMutated; stage = 'readiness' }
         }
         $lastReason = if (-not $brokerReady) { 'broker_not_ready' } elseif (-not $gatewayReady) { 'gateway_not_ready' } elseif (-not $configReady) { "config_$($config.Error ?? 'base_url_mismatch')" } elseif (-not $monitorState.Ready) { [string]$monitorState.Reason } else { [string]$healthState.Reason }
         Start-Sleep -Milliseconds 250
@@ -1030,15 +1384,22 @@ try {
 
     $script:ProxyBaseUrl = (Normalize-HeadroomBaseUrl -Value $GatewayBaseUrl).TrimEnd('/') + '/v1'
     $script:MonitorStatusUrl = (Normalize-HeadroomBaseUrl -Value $MonitorBaseUrl).TrimEnd('/') + '/status'
-    $script:ExpectedBaseUrl = if ($script:EffectiveRouteMode -eq 'proxy') { $script:ProxyBaseUrl } else { (Get-ConfigBaseUrl -Path $ConfigPath).BaseUrl }
+    $script:ExpectedBaseUrl = if ($script:EffectiveRouteMode -eq 'proxy') { $script:ProxyBaseUrl } else { (Get-ConfigBaseUrl -Path $ConfigPath -FallbackPath 'C:\Users\ma dao\.codex\config.toml').BaseUrl }
     if ($script:EffectiveRouteMode -eq 'proxy' -and -not (Invoke-Ensure)) {
         Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'ensure_failed' -Stage 'ensure' -Reason 'Headroom or policy gateway ensure failed'
     }
 
     $officialBypass = $false
     $routeWatchStartedByGate = $false
-    if (-not (Stop-RouteKeeperWatch)) { Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'route_watch_stop_failed' -Stage 'route_watch' -Reason 'existing route watcher could not be stopped' }
-    Start-Sleep -Milliseconds 1500
+    $reusedRouteWatcher = $false
+    if ($ReadinessOnly -and $script:EffectiveRouteMode -eq 'proxy' -and (Test-ExistingRouteKeeperWatch)) {
+        $reusedRouteWatcher = $true
+        Write-Audit -Level INFO -Event 'route_keeper_reused' -Fields @{ pid = (Get-Content -LiteralPath $RouteStatePath -Raw | ConvertFrom-Json).route_keeper_pid; mode = $script:EffectiveRouteMode; reason = 'readiness-only reused validated watcher; one-shot mutex contender skipped'; stage = 'route_watch' }
+    }
+    if (-not $reusedRouteWatcher) {
+        if (-not (Stop-RouteKeeperWatch)) { Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'route_watch_stop_failed' -Stage 'route_watch' -Reason 'existing route watcher could not be stopped' }
+        Start-Sleep -Milliseconds 1500
+    }
     if (-not $ReadinessOnly) { Remove-StaleRouteEvidence }
     if ($script:EffectiveRouteMode -eq 'official') {
         if (-not (Invoke-RouteKeeper)) { Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'route_keeper_failed' -Stage 'route' -Reason 'route keeper failed for official mode' }
@@ -1046,9 +1407,11 @@ try {
         $officialBypass = $true
     }
     else {
-        if (-not (Invoke-RouteKeeper -AllowRelayPending:$AllowRelayPending)) { Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'route_keeper_failed' -Stage 'route' -Reason 'route keeper failed for proxy mode' }
-        if (-not (Start-RouteKeeperWatch -AllowRelayPending:$AllowRelayPending)) { Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'route_watch_start_failed' -Stage 'route_watch' -Reason 'route watcher could not be started' }
-        $routeWatchStartedByGate = $true
+        if (-not $reusedRouteWatcher) {
+            if (-not (Invoke-RouteKeeper -AllowRelayPending:$AllowRelayPending)) { Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'route_keeper_failed' -Stage 'route' -Reason 'route keeper failed for proxy mode' }
+            if (-not (Start-RouteKeeperWatch -AllowRelayPending:$AllowRelayPending)) { Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'route_watch_start_failed' -Stage 'route_watch' -Reason 'route watcher could not be started' }
+            $routeWatchStartedByGate = $true
+        }
         # Readiness validates the watch contract. Starting it after the
         # readiness check made every proxy-mode gate reject its own one-shot
         # route state before the watcher could publish the required watch state.
@@ -1059,15 +1422,23 @@ try {
         # relay 57321 after the process is created.
         $allowRelayPending = [bool]$AllowRelayPending
         if (-not (Wait-Readiness -ExpectedBaseUrl $script:ExpectedBaseUrl -AllowRelayPending:$allowRelayPending)) { Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'readiness_failed' -Stage 'readiness' -Reason 'gateway, Headroom, or monitor readiness contract was not satisfied' }
-        $routeDeadline = [DateTime]::UtcNow.AddSeconds(20)
-        do {
-            if (Test-RouteReadyState -RequireSignal -AllowRelayPending:$allowRelayPending) { break }
-            Start-Sleep -Milliseconds 150
-        } while ([DateTime]::UtcNow -lt $routeDeadline)
-        if (-not (Test-RouteReadyState -RequireSignal -AllowRelayPending:$allowRelayPending)) {
-            Write-Audit -Level ERROR -Event 'route_watch_not_ready' -Fields @{ reason = 'route watcher signal/process/schema contract not confirmed before deadline'; error_code = 'route_watch_not_ready'; stage = 'watch' }
-            if ($routeWatchStartedByGate) { [void](Stop-RouteKeeperWatch) }
-            Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'route_watch_not_ready' -Stage 'watch' -Reason 'route watcher signal/process/schema contract not confirmed before deadline'
+        if ($reusedRouteWatcher) {
+            if (-not (Test-ExistingRouteKeeperWatch)) {
+                Write-Audit -Level ERROR -Event 'route_watch_not_ready' -Fields @{ reason = 'reused route watcher lost its validated identity or freshness'; error_code = 'route_watch_not_ready'; stage = 'watch' }
+                Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'route_watch_not_ready' -Stage 'watch' -Reason 'reused route watcher was no longer ready'
+            }
+        }
+        else {
+            $routeDeadline = [DateTime]::UtcNow.AddSeconds(20)
+            do {
+                if (Test-RouteReadyState -RequireSignal -AllowRelayPending:$allowRelayPending) { break }
+                Start-Sleep -Milliseconds 150
+            } while ([DateTime]::UtcNow -lt $routeDeadline)
+            if (-not (Test-RouteReadyState -RequireSignal -AllowRelayPending:$allowRelayPending)) {
+                Write-Audit -Level ERROR -Event 'route_watch_not_ready' -Fields @{ reason = 'route watcher signal/process/schema contract not confirmed before deadline'; error_code = 'route_watch_not_ready'; stage = 'watch' }
+                if ($routeWatchStartedByGate) { [void](Stop-RouteKeeperWatch) }
+                Exit-Startup -ExitCode 3 -Status failed -ErrorCode 'route_watch_not_ready' -Stage 'watch' -Reason 'route watcher signal/process/schema contract not confirmed before deadline'
+            }
         }
     }
     if ($ReadinessOnly) {

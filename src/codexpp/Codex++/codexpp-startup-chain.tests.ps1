@@ -57,14 +57,15 @@ $headroomRoot = Normalize-HeadroomBaseUrl -Value 'http://127.0.0.1:18789'
 Assert-Equal -Actual ($gatewayRoot.TrimEnd('/') + '/v1') -Expected 'http://127.0.0.1:18787/v1' -Message 'Codex proxy base uses gateway'
 Assert-Equal -Actual $headroomRoot -Expected 'http://127.0.0.1:18789' -Message 'health base uses Headroom'
 
-# Mirror the monitor's current twelve-item /status contract.  Kompress
-# deferred is warning-only (overall yellow), while overall red must fail closed.
+# Mirror the monitor's current thirteen-item /status contract (including
+# official-dataplane).  Kompress deferred is warning-only (overall yellow),
+# while overall red must fail closed.
 Invoke-Expression (Get-FunctionText -Path $gatePath -Name 'Get-ObjectProperty')
 Invoke-Expression (Get-FunctionText -Path $gatePath -Name 'ConvertTo-StatsNumber')
 Invoke-Expression (Get-FunctionText -Path $gatePath -Name 'Test-MonitorStatus')
 $monitorKeys = @(
     'gateway-livez', 'gateway-health', 'headroom-livez', 'headroom-health',
-    'relay', 'route', 'codex-connection', 'api', 'transport', 'kompress',
+    'relay', 'route', 'official-dataplane', 'codex-connection', 'api', 'transport', 'kompress',
     'token-accounting', 'monitor-core'
 )
 $observedAt = [DateTime]::UtcNow.ToString('o')
@@ -96,7 +97,7 @@ function Get-JsonEndpoint {
     [pscustomobject]@{ TransportOk = $true; StatusCode = 200; ParseError = $false; Body = $script:MonitorFixture }
 }
 $yellowStatus = Test-MonitorStatus -Uri 'http://fixture/status'
-Assert-True -Condition $yellowStatus.Ready -Message '12-item yellow monitor status is ready'
+Assert-True -Condition $yellowStatus.Ready -Message '13-item yellow monitor status is ready'
 $script:MonitorFixture.overall = 'red'
 $redStatus = Test-MonitorStatus -Uri 'http://fixture/status'
 Assert-True -Condition (-not $redStatus.Ready) -Message 'red monitor status fails closed'
@@ -116,15 +117,20 @@ try {
 Invoke-Expression (Get-FunctionText -Path $gatePath -Name 'ConvertTo-SafeText')
 Invoke-Expression (Get-FunctionText -Path $gatePath -Name 'Write-StartupResult')
 Invoke-Expression (Get-FunctionText -Path $gatePath -Name 'Get-ConfigHttpContract')
+Invoke-Expression (Get-FunctionText -Path $gatePath -Name 'Get-ConfigProtectedContract')
+Invoke-Expression (Get-FunctionText -Path $gatePath -Name 'Test-ConfigProtectedContract')
 $configFixturePath = Join-Path $fixtureRoot 'config.toml'
 [IO.File]::WriteAllText($configFixturePath, @'
 model_provider = "CodexPlusPlus"
 [model_providers.CodexPlusPlus]
 wire_api = "responses"
 base_url = "http://127.0.0.1:18787/v1"
+service_tier = "default"
 '@, [Text.UTF8Encoding]::new($false))
 $configFixture = Get-ConfigHttpContract -Path $configFixturePath
 Assert-True -Condition ($configFixture.Error -eq $null -and $configFixture.WireApi -eq 'responses' -and $null -eq $configFixture.SupportsWebsockets) -Message 'optional supports_websockets does not block proxy config contract'
+$gateProtectedFixture = Get-ConfigProtectedContract -Path $configFixturePath
+Assert-True -Condition ($gateProtectedFixture.Error -eq $null -and $gateProtectedFixture.WireApi -eq 'responses') -Message 'startup gate protected contract is readable'
 
 # A Codex launch may enter with a pending route, but the post-launch relay
 # gate must fail closed while helper 57321 is absent. Use this test process
@@ -151,6 +157,7 @@ finally {
 # the explicit pending switch, and the published process route never mutates
 # the supplier config.
 Invoke-Expression (Get-FunctionText -Path $keeperPath -Name 'Get-ObjectProperty')
+Invoke-Expression (Get-FunctionText -Path $keeperPath -Name 'Get-ConfigProtectedContract')
 Invoke-Expression (Get-FunctionText -Path $keeperPath -Name 'Test-LocalRelayEndpoint')
 Invoke-Expression (Get-FunctionText -Path $keeperPath -Name 'Get-HeadroomRouteReadiness')
 Invoke-Expression (Get-FunctionText -Path $keeperPath -Name 'Replace-RouteFileAtomically')
@@ -175,6 +182,8 @@ $script:RouteKeeperStartedAt = [DateTime]::UtcNow
 $script:RouteKeeperScriptPath = $keeperPath
 $script:WatchMode = $false
 $script:RouteFixture = 'pending'
+$heartbeatProtected = Get-ConfigProtectedContract -Path $configFixturePath
+Assert-True -Condition ($heartbeatProtected.Error -eq $null -and $heartbeatProtected.WireApi -eq 'responses') -Message 'route keeper protected contract fixture is readable'
 function Get-JsonEndpoint {
     param([Parameter(Mandatory)][string]$Uri)
     if ($Uri -like '*/livez') {
@@ -201,19 +210,37 @@ $malformedReadiness = Get-HeadroomRouteReadiness -AllowRelayPending
 Assert-True -Condition (-not $malformedReadiness.Ready) -Message 'route keeper rejects malformed/reachable helper failure'
 $script:RouteFixture = 'pending'
 $configBefore = (Get-FileHash -LiteralPath $configFixturePath -Algorithm SHA256).Hash
-Write-RouteState -Mode 'pureapi' -Protocol 'responses' -Action 'process-route-pending' -Status 'pending' -Reason 'helper pending fixture' -ConfigHash $configBefore -Provider 'CodexPlusPlus' -ProcessRouteBaseUrl $ProxyBaseUrl
+Write-RouteState -Mode 'pureapi' -Protocol 'responses' -Action 'process-route-pending' -Status 'pending' -Reason 'helper pending fixture' -ConfigHash $configBefore -Provider 'CodexPlusPlus' -ProcessRouteBaseUrl $ProxyBaseUrl -ProtectedContract $heartbeatProtected
 Assert-RouteStateWritten
 $pendingState = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
 Assert-True -Condition ([string]$pendingState.status -eq 'pending' -and [string]$pendingState.route_scope -eq 'process' -and [bool]$pendingState.config_mutated -eq $false -and [string]$pendingState.process_route_base_url -eq $ProxyBaseUrl -and [bool]$pendingState.allow_relay_pending) -Message 'pending route state is process-scoped and config immutable'
 $configAfter = (Get-FileHash -LiteralPath $configFixturePath -Algorithm SHA256).Hash
 Assert-Equal -Actual $configAfter -Expected $configBefore -Message 'pending route state leaves config hash unchanged'
 $script:RouteFixture = 'ready'
-Write-RouteState -Mode 'pureapi' -Protocol 'responses' -Action 'process-route' -Status 'ready' -Reason 'helper ready fixture' -ConfigHash $configBefore -Provider 'CodexPlusPlus' -ProcessRouteBaseUrl $ProxyBaseUrl
+Write-RouteState -Mode 'pureapi' -Protocol 'responses' -Action 'process-route' -Status 'ready' -Reason 'helper ready fixture' -ConfigHash $configBefore -Provider 'CodexPlusPlus' -ProcessRouteBaseUrl $ProxyBaseUrl -ProtectedContract $heartbeatProtected
 $readyState = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
 Assert-True -Condition ([string]$readyState.status -eq 'ready' -and [string]$readyState.route_scope -eq 'process') -Message 'single route refresh publishes ready state'
 $script:WatchMode = $true
-Write-RouteState -Mode 'pureapi' -Protocol 'responses' -Action 'process-route' -Status 'ready' -Reason 'heartbeat fixture' -ConfigHash $configBefore -Provider 'CodexPlusPlus' -ProcessRouteBaseUrl $ProxyBaseUrl
-$heartbeatSnapshot = [pscustomobject]@{ Ready = $true; Hash = $configBefore; Provider = 'CodexPlusPlus'; BaseUrl = $ProxyBaseUrl }
+Write-RouteState -Mode 'pureapi' -Protocol 'responses' -Action 'process-route' -Status 'ready' -Reason 'heartbeat fixture' -ConfigHash $configBefore -Provider 'CodexPlusPlus' -ProcessRouteBaseUrl $ProxyBaseUrl -ProtectedContract $heartbeatProtected
+$heartbeatSnapshot = [pscustomobject]@{ Ready = $true; Hash = $configBefore; Provider = 'CodexPlusPlus'; BaseUrl = $ProxyBaseUrl; Protected = $heartbeatProtected }
+$metadataConfig = (Get-Content -LiteralPath $configFixturePath -Raw).Replace('service_tier = "default"', 'service_tier = "updated"')
+[IO.File]::WriteAllText($configFixturePath, $metadataConfig, [Text.UTF8Encoding]::new($false))
+$metadataHash = (Get-FileHash -LiteralPath $configFixturePath -Algorithm SHA256).Hash
+$metadataProtected = Get-ConfigProtectedContract -Path $configFixturePath
+$metadataSnapshot = [pscustomobject]@{ Ready = $true; Hash = $metadataHash; Provider = 'CodexPlusPlus'; BaseUrl = $ProxyBaseUrl; Protected = $metadataProtected }
+Assert-True -Condition (Write-RouteHeartbeat -Snapshot $metadataSnapshot -EffectiveMode 'proxy') -Message 'ordinary provider metadata drift refreshes route-state hash atomically'
+$metadataState = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+Assert-Equal -Actual $metadataState.config_sha256 -Expected $metadataHash -Message 'heartbeat stores updated ordinary metadata hash'
+$heartbeatSnapshot = $metadataSnapshot
+$configBefore = $metadataHash
+$heartbeatProtected = $metadataProtected
+$protectedMutationConfig = $metadataConfig.Replace('wire_api = "responses"', 'wire_api = "chat"')
+[IO.File]::WriteAllText($configFixturePath, $protectedMutationConfig, [Text.UTF8Encoding]::new($false))
+$protectedMutationHash = (Get-FileHash -LiteralPath $configFixturePath -Algorithm SHA256).Hash
+$protectedMutation = Get-ConfigProtectedContract -Path $configFixturePath
+$protectedMutationSnapshot = [pscustomobject]@{ Ready = $true; Hash = $protectedMutationHash; Provider = 'CodexPlusPlus'; BaseUrl = $ProxyBaseUrl; Protected = $protectedMutation }
+Assert-True -Condition (-not (Write-RouteHeartbeat -Snapshot $protectedMutationSnapshot -EffectiveMode 'proxy')) -Message 'protected wire_api mutation rejects heartbeat'
+[IO.File]::WriteAllText($configFixturePath, $metadataConfig, [Text.UTF8Encoding]::new($false))
 $heartbeatStableFields = @('status', 'route_scope', 'config_mutated', 'config_sha256', 'provider', 'process_route_base_url', 'route_keeper_pid', 'route_keeper_script_path', 'route_keeper_mode')
 for ($cycle = 1; $cycle -le 3; $cycle++) {
     $cycleState = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json

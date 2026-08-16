@@ -16,6 +16,7 @@ $projectRoot = [IO.Path]::GetFullPath($ProjectRoot)
 $desktopRoot = [IO.Path]::GetFullPath($DesktopRoot)
 $launcher = Join-Path $projectRoot 'scripts\Launch-HeadroomForCodexPP.vbs'
 $shortcutPath = Join-Path $desktopRoot 'Headroom for Codex++.lnk'
+$desktopLauncherArguments = '//B //Nologo "' + $launcher + '"'
 $legacyShortcuts = @(
     (Join-Path $desktopRoot 'Codex++.lnk'),
     (Join-Path $desktopRoot 'Codex++ 管理工具.lnk')
@@ -68,7 +69,7 @@ function Get-FileSummary {
 function Get-ShortcutSummary {
     param([string]$Path)
     $file = Get-FileSummary -Path $Path
-    if (-not $file.exists) { return [ordered]@{status='missing';file=$file;target=$null;arguments=$null;working_directory=$null;icon_location=$null;metadata_hash=$null} }
+    if (-not $file.exists) { return [ordered]@{status='missing';file=$file;target=$null;arguments=$null;working_directory=$null;icon_location=$null;link_flags=$null;run_as_user=$false;metadata_hash=$null} }
     try {
         $shell = New-Object -ComObject WScript.Shell
         $shortcut = $shell.CreateShortcut((Resolve-FullPath -Path $Path))
@@ -76,11 +77,14 @@ function Get-ShortcutSummary {
         $arguments = [string]$shortcut.Arguments
         $working = [string]$shortcut.WorkingDirectory
         $icon = [string]$shortcut.IconLocation
+        $bytes = [IO.File]::ReadAllBytes((Resolve-FullPath -Path $Path))
+        $linkFlags = if ($bytes.Length -ge 0x18) { [BitConverter]::ToUInt32($bytes, 0x14) } else { $null }
+        $runAsUser = $null -ne $linkFlags -and (($linkFlags -band 0x00001000) -ne 0)
         $metadata = [ordered]@{target=$target;arguments=$arguments;working_directory=$working;icon_location=$icon}
-        return [ordered]@{status='present';file=$file;target=$target;arguments=$arguments;working_directory=$working;icon_location=$icon;metadata_hash=(Get-HashForText -Text (($metadata | ConvertTo-Json -Compress)))}
+        return [ordered]@{status='present';file=$file;target=$target;arguments=$arguments;working_directory=$working;icon_location=$icon;link_flags=$linkFlags;run_as_user=$runAsUser;metadata_hash=(Get-HashForText -Text (($metadata | ConvertTo-Json -Compress)))}
     }
     catch {
-        return [ordered]@{status='error';file=$file;target=$null;arguments=$null;working_directory=$null;icon_location=$null;metadata_hash=$null;error=$_.Exception.GetType().Name}
+        return [ordered]@{status='error';file=$file;target=$null;arguments=$null;working_directory=$null;icon_location=$null;link_flags=$null;run_as_user=$false;metadata_hash=$null;error=$_.Exception.GetType().Name}
     }
 }
 
@@ -130,7 +134,9 @@ $targetWscript = Resolve-FullPath -Path (Join-Path $env:WINDIR 'System32\wscript
 $targetConfigured = $targetSummary.status -eq 'present' -and
     [string]$targetSummary.target -and [IO.Path]::GetFullPath([string]$targetSummary.target).Equals($targetWscript, [StringComparison]::OrdinalIgnoreCase) -and
     [string]$targetSummary.arguments -match [regex]::Escape($launcher) -and
-    [string]$targetSummary.working_directory -and [IO.Path]::GetFullPath([string]$targetSummary.working_directory).Equals($projectRoot, [StringComparison]::OrdinalIgnoreCase)
+    [string]$targetSummary.arguments -notmatch '(?i)--phase-b' -and
+    [string]$targetSummary.working_directory -and [IO.Path]::GetFullPath([string]$targetSummary.working_directory).Equals($projectRoot, [StringComparison]::OrdinalIgnoreCase) -and
+    [bool]$targetSummary.run_as_user
 $targetPlanStatus = if ($targetSummary.status -eq 'error') { 'error' } elseif ($targetConfigured) { 'already_configured' } elseif ($targetSummary.status -eq 'missing') { 'create_required' } else { 'update_required' }
 
 $legacyResults = [System.Collections.Generic.List[object]]::new()
@@ -164,13 +170,32 @@ if ($Execute) {
         $shell = New-Object -ComObject WScript.Shell
         $shortcut = $shell.CreateShortcut($shortcutPath)
         $shortcut.TargetPath = $targetWscript
-        $shortcut.Arguments = '//B //Nologo "' + $launcher + '"'
+        $shortcut.Arguments = $desktopLauncherArguments
         $shortcut.WorkingDirectory = $projectRoot
         $shortcut.IconLocation = 'D:\program\Codex++\codex-plus-plus-manager.exe,0'
         $shortcut.Description = 'Start Headroom, Codex++ Manager and Codex++ through the verified project-root route'
         $shortcut.Save()
+        # The shortcut must launch elevated on a plain double-click so the
+        # runas in Launch-HeadroomForCodexPP.vbs always succeeds regardless of
+        # the invoking shell's integrity.  WScript.Shell.CreateShortcut cannot
+        # express "run as administrator", so set SLDF_RUNAS_USER (0x00001000)
+        # in the ShellLinkHeader LinkFlags (offset 0x14, little-endian) after
+        # Save().  This is the documented .lnk flag Windows reads to prompt
+        # for elevation on launch; it survives Explorer and COM reads.
+        $lnkBytes = [IO.File]::ReadAllBytes($shortcutPath)
+        if ($lnkBytes.Length -lt 0x18) { throw 'shortcut_too_small_for_runas_flag' }
+        $linkFlags = [BitConverter]::ToUInt32($lnkBytes, 0x14)
+        $linkFlags = $linkFlags -bor 0x00001000
+        $lnkBytes[0x14] = [byte]($linkFlags -band 0xFF)
+        $lnkBytes[0x15] = [byte](($linkFlags -shr 8) -band 0xFF)
+        $lnkBytes[0x16] = [byte](($linkFlags -shr 16) -band 0xFF)
+        $lnkBytes[0x17] = [byte](($linkFlags -shr 24) -band 0xFF)
+        [IO.File]::WriteAllBytes($shortcutPath, $lnkBytes)
         $verified = Get-ShortcutSummary -Path $shortcutPath
-        if ($verified.status -ne 'present' -or -not [IO.Path]::GetFullPath([string]$verified.target).Equals($targetWscript, [StringComparison]::OrdinalIgnoreCase) -or [string]$verified.arguments -notmatch [regex]::Escape($launcher)) { throw 'desktop_shortcut_verification_failed' }
+        if ($verified.status -ne 'present' -or -not [IO.Path]::GetFullPath([string]$verified.target).Equals($targetWscript, [StringComparison]::OrdinalIgnoreCase) -or [string]$verified.arguments -notmatch [regex]::Escape($launcher) -or [string]$verified.arguments -match '(?i)--phase-b') { throw 'desktop_shortcut_verification_failed' }
+        $finalLnkBytes = [IO.File]::ReadAllBytes($shortcutPath)
+        $finalLinkFlags = [BitConverter]::ToUInt32($finalLnkBytes, 0x14)
+        if (($finalLinkFlags -band 0x00001000) -eq 0) { throw 'desktop_shortcut_runas_flag_missing' }
     }
 
     foreach ($taskEntry in $taskResults) {

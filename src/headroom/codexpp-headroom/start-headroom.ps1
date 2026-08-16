@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
     [int]$Port = 18789,
+    [ValidateRange(1, 65535)]
+    [int]$HelperPort = 57321,
     [ValidateSet(1, 2)]
     [int]$Workers = 1,
     [string]$PythonPath = '',
@@ -21,8 +23,17 @@ if ([string]::IsNullOrWhiteSpace($KompressEndpoint)) { $KompressEndpoint = 'http
 [IO.Directory]::CreateDirectory($RuntimeLogRoot) | Out-Null
 $python = [IO.Path]::GetFullPath($PythonPath)
 $launcher = Join-Path $PSScriptRoot 'headroom-launcher.py'
-$target = 'http://127.0.0.1:57321'
+$target = "http://127.0.0.1:$HelperPort"
 $kompressEndpoint = $KompressEndpoint
+$script:StartScriptPath = $PSCommandPath
+$script:RuntimeContractVersion = 1
+$script:ToolOutputParallelism = '1'
+$script:KompressMaxConcurrent = '1'
+$script:ResponsesCompressionSoftBudgetSeconds = [Environment]::GetEnvironmentVariable('HEADROOM_RESPONSES_COMPRESSION_SOFT_BUDGET_SECONDS', 'Process')
+if ([string]::IsNullOrWhiteSpace($script:ResponsesCompressionSoftBudgetSeconds)) { $script:ResponsesCompressionSoftBudgetSeconds = '20' }
+$script:KompressRequestTimeoutSeconds = [Environment]::GetEnvironmentVariable('KOMPRESS_REQUEST_TIMEOUT_SECONDS', 'Process')
+if ([string]::IsNullOrWhiteSpace($script:KompressRequestTimeoutSeconds)) { $script:KompressRequestTimeoutSeconds = '20' }
+$script:PatchSyncReceiptPath = Join-Path $RuntimeStateRoot 'headroom-runtime-patch-sync.json'
 $legacyStatePath = Join-Path $RuntimeStateRoot 'headroom-state.json'
 # New Headroom instances are isolated by port. The legacy path is read-only
 # compatibility input for already-running instances.
@@ -37,6 +48,60 @@ $listenerPid = $null
 $startupCleanupStatus = 'not_attempted'
 
 . (Join-Path $PSScriptRoot 'activation-lib.ps1')
+
+function Get-HeadroomPatchSyncContract {
+    if (-not (Test-Path -LiteralPath $script:PatchSyncReceiptPath -PathType Leaf)) {
+        return [ordered]@{ patch_sync_status = 'missing'; patch_sync_version = 0; patch_sync_manifest_sha256 = '' }
+    }
+    try {
+        $receipt = Get-Content -LiteralPath $script:PatchSyncReceiptPath -Raw | ConvertFrom-Json
+        return [ordered]@{
+            patch_sync_status = [string]$receipt.status
+            patch_sync_version = [int]$receipt.sync_version
+            patch_sync_manifest_sha256 = [string]$receipt.manifest_sha256
+        }
+    }
+    catch {
+        return [ordered]@{ patch_sync_status = 'invalid'; patch_sync_version = 0; patch_sync_manifest_sha256 = '' }
+    }
+}
+
+function Assert-HeadroomPatchSyncContract {
+    $contract = Get-HeadroomPatchSyncContract
+    if ([string]$contract.patch_sync_status -notin @('synced', 'in_sync') -or [int]$contract.patch_sync_version -ne 1 -or [string]::IsNullOrWhiteSpace([string]$contract.patch_sync_manifest_sha256)) {
+        throw 'headroom_runtime_patch_sync_missing_or_invalid'
+    }
+}
+
+function Get-HeadroomRuntimeContract {
+    $launcherHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $launcher).Hash.ToLowerInvariant()
+    $startHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $script:StartScriptPath).Hash.ToLowerInvariant()
+    $patchSync = Get-HeadroomPatchSyncContract
+    return [ordered]@{
+        runtime_contract_version = $script:RuntimeContractVersion
+        launcher_sha256 = $launcherHash
+        start_script_sha256 = $startHash
+        port = $Port
+        helper_port = $HelperPort
+        workers = $Workers
+        target = $target
+        kompress_endpoint = $kompressEndpoint
+        tool_output_parallelism = $script:ToolOutputParallelism
+        kompress_max_concurrent = $script:KompressMaxConcurrent
+        responses_compression_soft_budget_seconds = $script:ResponsesCompressionSoftBudgetSeconds
+        kompress_request_timeout_seconds = $script:KompressRequestTimeoutSeconds
+        patch_sync_status = $patchSync.patch_sync_status
+        patch_sync_version = $patchSync.patch_sync_version
+        patch_sync_manifest_sha256 = $patchSync.patch_sync_manifest_sha256
+    }
+}
+
+function Get-HeadroomRuntimeContractHash {
+    $contract = Get-HeadroomRuntimeContract
+    $canonical = (($contract.Keys | Sort-Object | ForEach-Object { "$_=$($contract[$_])" }) -join "`n")
+    $bytes = [Text.Encoding]::UTF8.GetBytes($canonical)
+    return (([Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+}
 
 function Get-ListenerPid {
     param([int]$ListenPort)
@@ -252,6 +317,22 @@ function Assert-StateCompatibility {
     if ([string]$State.http_mode -ne 'responses' -or [string]$State.wire_api -ne 'responses' -or $State.supports_websockets -ne $false) {
         throw "Headroom state HTTP contract is incompatible; refusing startup."
     }
+    $expectedContract = Get-HeadroomRuntimeContract
+    $stateContractHash = $State.PSObject.Properties['runtime_contract_sha256']
+    if (-not $stateContractHash -or [string]$stateContractHash.Value -ne (Get-HeadroomRuntimeContractHash)) {
+        throw 'Headroom runtime contract is stale or missing; refusing reuse of existing listener.'
+    }
+    $stateTarget = $State.PSObject.Properties['Target']
+    if ($stateTarget -and -not [string]::Equals([string]$stateTarget.Value, $target, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Headroom state target is incompatible; expected $target."
+    }
+    $stateHelperPort = $State.PSObject.Properties['HelperPort']
+    if ($stateHelperPort) {
+        $stateHelperValue = 0
+        if (-not [int]::TryParse([string]$stateHelperPort.Value, [ref]$stateHelperValue) -or $stateHelperValue -ne $HelperPort) {
+            throw "Headroom state helper port is incompatible; expected $HelperPort."
+        }
+    }
 }
 
 function Assert-StateListener {
@@ -299,9 +380,21 @@ function Write-HeadroomState {
     if ($null -eq $ParentProcess -or [string]::IsNullOrWhiteSpace($ParentProcess.Path) -or $null -eq $ParentProcess.StartTime) {
         throw "Refusing to write Headroom state; parent executable identity is unavailable"
     }
+        $runtimeContract = Get-HeadroomRuntimeContract
         $stateJson = [pscustomobject]@{
             state_schema_version = 2
             route_contract_version = 2
+            runtime_contract_version = $script:RuntimeContractVersion
+            runtime_contract_sha256 = Get-HeadroomRuntimeContractHash
+            launcher_sha256 = $runtimeContract.launcher_sha256
+            start_script_sha256 = $runtimeContract.start_script_sha256
+            tool_output_parallelism = $script:ToolOutputParallelism
+            kompress_max_concurrent = $script:KompressMaxConcurrent
+            responses_compression_soft_budget_seconds = $script:ResponsesCompressionSoftBudgetSeconds
+            kompress_request_timeout_seconds = $script:KompressRequestTimeoutSeconds
+            patch_sync_status = $runtimeContract.patch_sync_status
+            patch_sync_version = $runtimeContract.patch_sync_version
+            patch_sync_manifest_sha256 = $runtimeContract.patch_sync_manifest_sha256
             state_path = $statePath
             state_role = 'active-headroom'
             http_mode = 'responses'
@@ -311,6 +404,7 @@ function Write-HeadroomState {
         ListenerPid = $ListenerPid
         ParentPid = $ParentPid
         Port = $Port
+        HelperPort = $HelperPort
         Workers = $Workers
         Target = $target
         StartedAt = $StartedAt
@@ -332,6 +426,7 @@ function Write-HeadroomState {
 }
 
 try {
+Assert-HeadroomPatchSyncContract
 if (-not (Test-Path -LiteralPath $python)) {
     throw "Headroom Python runtime not found: $python"
 }
@@ -381,6 +476,8 @@ Write-HeadroomStartupState -Status 'starting' -Code $null
 
 $kompressIntraThreads = if ($Workers -le 1) { '12' } else { '8' }
 $environment = @{
+    # Preserve the frozen prefix while allowing the normal compression
+    # decision pipeline to process eligible new content.
     HEADROOM_MODE = 'cache'
     HEADROOM_KOMPRESS_BACKEND = 'onnx_cpu'
     HEADROOM_ONNX_CPU_ARENA = '1'
@@ -390,6 +487,7 @@ $environment = @{
     HF_HUB_DISABLE_SYSTEM_DOWNLOADS = '1'
     HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE = '1'
     HEADROOM_KOMPRESS_TIME_BUDGET_SECONDS = '25'
+    HEADROOM_RESPONSES_COMPRESSION_SOFT_BUDGET_SECONDS = $script:ResponsesCompressionSoftBudgetSeconds
     HEADROOM_PIPELINE_BREAKER_THRESHOLD = '3'
     HEADROOM_PIPELINE_BREAKER_COOLDOWN_S = '300'
     # ONNX CPU owns the inference call. Twelve threads are fastest on this
@@ -398,9 +496,15 @@ $environment = @{
     HEADROOM_KOMPRESS_ONNX_INTRA_THREADS = $kompressIntraThreads
     HEADROOM_KOMPRESS_ONNX_INTER_THREADS = '1'
     HEADROOM_KOMPRESS_MAX_CONCURRENT = '1'
+    # The Responses handler otherwise dispatches four compression units in
+    # parallel, while the remote broker intentionally owns one serialized
+    # ONNX worker. Align both sides to prevent avoidable queue_full fallback.
+    HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM = '1'
     HEADROOM_KOMPRESS_ENDPOINT = $kompressEndpoint
     HEADROOM_WORKERS = $Workers.ToString()
     HEADROOM_RUNTIME_ROOT = $runtimeRoot
+    # Propagate the canary compression-debug opt-in if the caller set it.
+    HEADROOM_CODEX_COMPRESSION_DEBUG = [Environment]::GetEnvironmentVariable('HEADROOM_CODEX_COMPRESSION_DEBUG', 'Process')
     # Headroom's official path resolver uses this variable for ~/.headroom
     # state, logs, savings and CCR data. Keep every runtime write under the
     # project root instead of falling back to the user's C: profile.

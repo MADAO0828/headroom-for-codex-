@@ -2,6 +2,8 @@
 param(
     [int]$Port = 18787,
     [int]$HeadroomPort = 18789,
+    [ValidateRange(1, 65535)]
+    [int]$HelperPort = 57321,
     [ValidateSet(1, 2)]
     [int]$Workers = 1,
     [string]$PythonPath = '',
@@ -34,17 +36,23 @@ $gatewayMetricsStatePath = Join-Path $RuntimeStateRoot 'gateway-metrics-state.js
 $python = [IO.Path]::GetFullPath($PythonPath)
 
 # Environment variables for Headroom. Set here so start-headroom.ps1 inherits them.
+# Cache mode is the production coding posture: preserve the frozen prefix and
+# send eligible new content through the normal compression decision pipeline.
 $env:HEADROOM_MODE = 'cache'
 $env:HEADROOM_KOMPRESS_BACKEND = 'onnx_cpu'
 $env:HEADROOM_ONNX_CPU_ARENA = '1'
 $env:HEADROOM_SKIP_UPSTREAM_CHECK = '1'
 $env:HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE = '1'
 $env:HEADROOM_KOMPRESS_TIME_BUDGET_SECONDS = '25'
+$env:HEADROOM_RESPONSES_COMPRESSION_SOFT_BUDGET_SECONDS = '20'
+$env:KOMPRESS_REQUEST_TIMEOUT_SECONDS = '20'
 $env:HEADROOM_PIPELINE_BREAKER_THRESHOLD = '3'
 $env:HEADROOM_PIPELINE_BREAKER_COOLDOWN_S = '300'
 $env:HEADROOM_KOMPRESS_ONNX_INTER_THREADS = '1'
 $env:HEADROOM_KOMPRESS_MAX_CONCURRENT = '1'
+$env:HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM = '1'
 $env:HEADROOM_KOMPRESS_ENDPOINT = $KompressEndpoint
+$env:HELPER_URL = "http://127.0.0.1:$HelperPort"
 $env:HEADROOM_WORKERS = $Workers.ToString()
 $env:HEADROOM_RUNTIME_ROOT = $runtimeRoot
 $env:HEADROOM_WORKSPACE_DIR = Join-Path $runtimeRoot 'private\headroom-workspace'
@@ -55,6 +63,70 @@ $env:TRANSFORMERS_CACHE = Join-Path $runtimeRoot 'cache\huggingface\transformers
 $env:HEADROOM_TELEMETRY = 'off'
 $env:TRANSFORMERS_OFFLINE = '1'
 $env:HF_HUB_DISABLE_SYSTEM_DOWNLOADS = '1'
+
+$script:RuntimeContractVersion = 1
+$script:ToolOutputParallelism = '1'
+$script:KompressMaxConcurrent = '1'
+$script:ResponsesCompressionSoftBudgetSeconds = [Environment]::GetEnvironmentVariable('HEADROOM_RESPONSES_COMPRESSION_SOFT_BUDGET_SECONDS', 'Process')
+if ([string]::IsNullOrWhiteSpace($script:ResponsesCompressionSoftBudgetSeconds)) { $script:ResponsesCompressionSoftBudgetSeconds = '20' }
+$script:KompressRequestTimeoutSeconds = [Environment]::GetEnvironmentVariable('KOMPRESS_REQUEST_TIMEOUT_SECONDS', 'Process')
+if ([string]::IsNullOrWhiteSpace($script:KompressRequestTimeoutSeconds)) { $script:KompressRequestTimeoutSeconds = '20' }
+$script:PatchSyncReceiptPath = Join-Path $RuntimeStateRoot 'headroom-runtime-patch-sync.json'
+
+function Get-HeadroomPatchSyncContract {
+    if (-not (Test-Path -LiteralPath $script:PatchSyncReceiptPath -PathType Leaf)) {
+        return [ordered]@{ patch_sync_status = 'missing'; patch_sync_version = 0; patch_sync_manifest_sha256 = '' }
+    }
+    try {
+        $receipt = Get-Content -LiteralPath $script:PatchSyncReceiptPath -Raw | ConvertFrom-Json
+        return [ordered]@{
+            patch_sync_status = [string]$receipt.status
+            patch_sync_version = [int]$receipt.sync_version
+            patch_sync_manifest_sha256 = [string]$receipt.manifest_sha256
+        }
+    }
+    catch {
+        return [ordered]@{ patch_sync_status = 'invalid'; patch_sync_version = 0; patch_sync_manifest_sha256 = '' }
+    }
+}
+
+function Assert-HeadroomPatchSyncContract {
+    $contract = Get-HeadroomPatchSyncContract
+    if ([string]$contract.patch_sync_status -notin @('synced', 'in_sync') -or [int]$contract.patch_sync_version -ne 1 -or [string]::IsNullOrWhiteSpace([string]$contract.patch_sync_manifest_sha256)) {
+        throw 'headroom_runtime_patch_sync_missing_or_invalid'
+    }
+}
+
+function Get-HeadroomRuntimeContract {
+    $launcherPath = Join-Path $PSScriptRoot 'headroom-launcher.py'
+    $launcherHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $launcherPath).Hash.ToLowerInvariant()
+    $startHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $startScript).Hash.ToLowerInvariant()
+    $patchSync = Get-HeadroomPatchSyncContract
+    return [ordered]@{
+        runtime_contract_version = $script:RuntimeContractVersion
+        launcher_sha256 = $launcherHash
+        start_script_sha256 = $startHash
+        port = $Port
+        helper_port = $HelperPort
+        workers = $Workers
+        target = "http://127.0.0.1:$HelperPort"
+        kompress_endpoint = $KompressEndpoint
+        tool_output_parallelism = $script:ToolOutputParallelism
+        kompress_max_concurrent = $script:KompressMaxConcurrent
+        responses_compression_soft_budget_seconds = $script:ResponsesCompressionSoftBudgetSeconds
+        kompress_request_timeout_seconds = $script:KompressRequestTimeoutSeconds
+        patch_sync_status = $patchSync.patch_sync_status
+        patch_sync_version = $patchSync.patch_sync_version
+        patch_sync_manifest_sha256 = $patchSync.patch_sync_manifest_sha256
+    }
+}
+
+function Get-HeadroomRuntimeContractHash {
+    $contract = Get-HeadroomRuntimeContract
+    $canonical = (($contract.Keys | Sort-Object | ForEach-Object { "$_=$($contract[$_])" }) -join "`n")
+    $bytes = [Text.Encoding]::UTF8.GetBytes($canonical)
+    return (([Security.Cryptography.SHA256]::Create().ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+}
 
 function Get-ListenerPid {
     param([int]$ListenPort)
@@ -194,7 +266,8 @@ function Test-StateCompatibility {
     if ($null -eq $State) { return $false }
     $schema = $State.PSObject.Properties['state_schema_version']
     $contract = $State.PSObject.Properties['route_contract_version']
-    return ($null -ne $schema -and [int]$schema.Value -eq 2 -and $null -ne $contract -and [int]$contract.Value -eq 2 -and [string]$State.http_mode -eq 'responses' -and [string]$State.wire_api -eq 'responses' -and $State.supports_websockets -eq $false)
+    $runtimeHash = $State.PSObject.Properties['runtime_contract_sha256']
+    return ($null -ne $schema -and [int]$schema.Value -eq 2 -and $null -ne $contract -and [int]$contract.Value -eq 2 -and [string]$State.http_mode -eq 'responses' -and [string]$State.wire_api -eq 'responses' -and $State.supports_websockets -eq $false -and $null -ne $runtimeHash -and [string]$runtimeHash.Value -eq (Get-HeadroomRuntimeContractHash))
 }
 
 function Test-ManagedHeadroomListenerIdentity {
@@ -307,6 +380,19 @@ function Test-ManagedHeadroomListenerIdentity {
         & $fail 'listener command line does not identify this Headroom deployment'
     }
 
+    $expectedTarget = "http://127.0.0.1:$HelperPort"
+    $stateTarget = $State.PSObject.Properties['Target']
+    if ($stateTarget -and -not [string]::Equals([string]$stateTarget.Value, $expectedTarget, [StringComparison]::OrdinalIgnoreCase)) {
+        & $fail "state target does not match helper port $HelperPort"
+    }
+    $stateHelperPort = $State.PSObject.Properties['HelperPort']
+    if ($stateHelperPort) {
+        $stateHelperValue = 0
+        if (-not [int]::TryParse([string]$stateHelperPort.Value, [ref]$stateHelperValue) -or $stateHelperValue -ne $HelperPort) {
+            & $fail "state helper port does not match $HelperPort"
+        }
+    }
+
     try {
         $stateStartedAt = $State.ListenerStartedAt
         if ($stateStartedAt -is [DateTime]) {
@@ -361,7 +447,7 @@ function Test-GatewaySnapshot {
     if (-not $AllowRelayPending) { return $false }
 
     # Before Manager/client launch, preserve only the exact Gateway state
-    # produced while helper 57321 is not listening.  Any other 503, including
+    # produced while helper $HelperPort is not listening.  Any other 503, including
     # an unhealthy Headroom dependency or a reachable helper returning 500,
     # remains fail-closed.
     $checks = $Body.PSObject.Properties['checks']
@@ -405,8 +491,10 @@ function Get-GatewayProcessPath {
 function Assert-GatewayState {
     param([Parameter(Mandatory)][object]$State,[int]$ListenerPid,[object]$Process)
     if ($null -eq $Process -or $Process.Name -notlike 'python*') { throw "policy_gateway_port_conflict_unmanaged: listener process is not Python" }
-    $portValue = 0; $pidValue = 0
+    $portValue = 0; $pidValue = 0; $headroomValue = 0; $helperValue = 0
     if (-not $State -or -not $State.PSObject.Properties['Port'] -or -not [int]::TryParse([string]$State.Port,[ref]$portValue) -or $portValue -ne $GatewayPort) { throw "policy_gateway_port_conflict_unmanaged: gateway state port mismatch" }
+    if ($State.PSObject.Properties['HeadroomPort'] -and (-not [int]::TryParse([string]$State.HeadroomPort,[ref]$headroomValue) -or $headroomValue -ne $Port)) { throw "policy_gateway_port_conflict_unmanaged: gateway headroom port mismatch" }
+    if ($State.PSObject.Properties['HelperPort'] -and (-not [int]::TryParse([string]$State.HelperPort,[ref]$helperValue) -or $helperValue -ne $HelperPort)) { throw "policy_gateway_port_conflict_unmanaged: gateway helper port mismatch" }
     if (-not $State.PSObject.Properties['Pid'] -or -not [int]::TryParse([string]$State.Pid,[ref]$pidValue) -or $pidValue -ne $ListenerPid) { throw "policy_gateway_port_conflict_unmanaged: gateway state PID mismatch" }
     $statePathValue = [string]$State.Path
     $actualPath = Get-GatewayProcessPath -Process $Process
@@ -425,7 +513,7 @@ function Write-GatewayState {
         Pid = [int]$Process.Id
         Port = $GatewayPort
         HeadroomPort = $Port
-        HelperPort = 57321
+        HelperPort = $HelperPort
         Path = Get-GatewayProcessPath -Process $Process
         StartedAt = ([DateTime]::UtcNow.ToString('o'))
         updated_at_utc = ([DateTime]::UtcNow.ToString('o'))
@@ -459,7 +547,7 @@ function Ensure-PolicyGateway {
     $stdoutPath = Join-Path $RuntimeLogRoot "gateway-$GatewayPort.stdout.log"
     $stderrPath = Join-Path $RuntimeLogRoot "gateway-$GatewayPort.stderr.log"
     $env:HEADROOM_URL = $baseUrl
-    $env:HELPER_URL = 'http://127.0.0.1:57321'
+    $env:HELPER_URL = "http://127.0.0.1:$HelperPort"
     $env:POLICY_GATEWAY_STATE_PATH = $gatewayMetricsStatePath
     $gatewayProcess = Start-Process -FilePath $python -ArgumentList @('-m','uvicorn','gateway:app','--host','127.0.0.1','--port',$GatewayPort.ToString(),'--no-access-log') -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
     $deadline = (Get-Date).AddSeconds(30)
@@ -497,6 +585,7 @@ try {
         Write-Log "mutex timeout"
         throw "Timed out waiting for the Headroom ensure lock"
     }
+    Assert-HeadroomPatchSyncContract
 
     if (-not (Test-Path -LiteralPath $startScript) -or -not (Test-Path -LiteralPath $stopScript)) {
         Write-Log "lifecycle scripts missing"
@@ -522,7 +611,7 @@ try {
     if ($null -eq $listenerPid) {
         Write-Log "no listener on port $Port, calling start-headroom.ps1"
         try {
-            & $startScript -Port $Port -Workers $Workers -PythonPath $python -RuntimeStateRoot $RuntimeStateRoot -RuntimeLogRoot $RuntimeLogRoot -KompressEndpoint $KompressEndpoint *>$null
+            & $startScript -Port $Port -HelperPort $HelperPort -Workers $Workers -PythonPath $python -RuntimeStateRoot $RuntimeStateRoot -RuntimeLogRoot $RuntimeLogRoot -KompressEndpoint $KompressEndpoint *>$null
             Write-Log "start-headroom.ps1 completed"
         } catch {
             Write-Log "start-headroom.ps1 threw: $($_.Exception.Message)"
@@ -540,7 +629,7 @@ try {
                 throw "Refusing to manage PID $listenerPid; listener process identity is not Headroom Python"
             }
             $healthy = Test-HeadroomHealthy
-            if (-not $healthy) {
+            if (-not $healthy -or -not (Test-StateCompatibility -State $state)) {
                 Write-Log "Headroom unhealthy, stopping PID $listenerPid"
                 $null = Test-ManagedHeadroomListenerIdentity -State $state -ListenerPid $listenerPid -Process $listenerProcess
                 try { & $stopScript -Port $Port -RuntimeStateRoot $RuntimeStateRoot -ErrorAction SilentlyContinue | Out-Null } catch { }
@@ -561,9 +650,7 @@ try {
                     Write-Log "kill cleanup error: $($_.Exception.Message)"
                 }
                 Write-Log "starting Headroom"
-                & $startScript -Port $Port -Workers $Workers -PythonPath $python -RuntimeStateRoot $RuntimeStateRoot -RuntimeLogRoot $RuntimeLogRoot -KompressEndpoint $KompressEndpoint *>$null
-            } elseif (-not (Test-StateCompatibility -State $state)) {
-                Write-Log "Headroom is healthy and identity-matched; retaining legacy state contract without restart"
+                & $startScript -Port $Port -HelperPort $HelperPort -Workers $Workers -PythonPath $python -RuntimeStateRoot $RuntimeStateRoot -RuntimeLogRoot $RuntimeLogRoot -KompressEndpoint $KompressEndpoint *>$null
             }
         }
     }

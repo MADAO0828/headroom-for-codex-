@@ -66,6 +66,7 @@ class FakeAsyncClient:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         transport = httpx.MockTransport(self.handler)
         self._client = REAL_ASYNC_CLIENT(*args, transport=transport, **kwargs)
+        self.init_kwargs = dict(kwargs)
         self.closed = False
         type(self).instances.append(self)
 
@@ -229,6 +230,95 @@ class GatewayContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["token_accounting"]["saved"], 60)
         self.assertNotIn("secret", json.dumps(state))
 
+    async def test_metrics_correlation_source_and_header_redaction(self) -> None:
+        raw_marker = "synthetic-run-secret-20260802"
+        raw_correlation = "client-correlation-secret"
+        response = await self.client.post(
+            "/v1/responses",
+            headers={
+                "user-agent": "python-httpx/0.28.1",
+                "x-headroom-synthetic-run-id": raw_marker,
+                "x-headroom-correlation-id": raw_correlation,
+                "x-request-id": "client-request-secret",
+                "x-headroom-entrypoint": "synthetic",
+            },
+            json={"input": "sensitive body"},
+        )
+        self.assertEqual(response.status_code, 200)
+        upstream = next(item for item in self.requests if item.url.path == "/v1/responses")
+        self.assertNotEqual(upstream.headers["x-headroom-request-id"], raw_correlation)
+        self.assertNotEqual(upstream.headers["x-headroom-correlation-id"], raw_correlation)
+        self.assertNotEqual(upstream.headers["x-headroom-synthetic-run-id"], raw_marker)
+        self.assertNotIn("x-request-id", {key.lower() for key in upstream.headers})
+        self.assertNotIn("x-correlation-id", {key.lower() for key in upstream.headers})
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        metric = state["recent"][-1]
+        self.assertRegex(metric["request_id"], r"^gw_[0-9a-f]{32}$")
+        self.assertRegex(metric["correlation_id"], r"^corr_[0-9a-f]{32}$")
+        self.assertRegex(metric["synthetic_run_id"], r"^syn_[0-9a-f]{24}$")
+        self.assertEqual(metric["entrypoint"], "synthetic")
+        self.assertEqual(metric["source_hint"], "synthetic_header")
+        self.assertEqual(metric["user_agent_class"], "python_httpx")
+        self.assertEqual(metric["request_category"], "responses")
+        self.assertEqual(metric["category"], "responses")
+        self.assertEqual(metric["upstream_target"], "headroom")
+        self.assertEqual(metric["upstream_targets"], ["headroom"])
+        self.assertIsInstance(metric["started_at"], str)
+        self.assertIsInstance(metric["completed_at"], str)
+        self.assertEqual(response.headers["x-headroom-request-id"], metric["request_id"])
+        self.assertEqual(response.headers["x-headroom-correlation-id"], metric["correlation_id"])
+        serialized = json.dumps(state)
+        self.assertNotIn(raw_marker, serialized)
+        self.assertNotIn(raw_correlation, serialized)
+        self.assertNotIn("sensitive body", serialized)
+
+    async def test_correlation_stays_stable_across_helper_fallback(self) -> None:
+        self.mode = "headroom_connect_error"
+        response = await self.client.post(
+            "/v1/responses",
+            headers={"x-headroom-synthetic-run-id": "fallback-run"},
+            json={"input": "fallback"},
+        )
+        self.assertEqual(response.status_code, 200)
+        requests = [item for item in self.requests if item.url.path == "/v1/responses"]
+        headroom_request = next(item for item in requests if item.url.host == "headroom.test")
+        helper_request = next(item for item in requests if item.url.host == "helper.test")
+        self.assertEqual(
+            headroom_request.headers["x-headroom-request-id"],
+            helper_request.headers["x-headroom-request-id"],
+        )
+        self.assertEqual(
+            headroom_request.headers["x-headroom-correlation-id"],
+            helper_request.headers["x-headroom-correlation-id"],
+        )
+        self.assertEqual(
+            headroom_request.headers["x-headroom-synthetic-run-id"],
+            helper_request.headers["x-headroom-synthetic-run-id"],
+        )
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        metric = state["recent"][-1]
+        self.assertEqual(metric["upstream_target"], "helper")
+        self.assertEqual(metric["upstream_targets"], ["headroom", "helper"])
+        self.assertEqual(metric["fallback"], "headroom_connect_error")
+
+    def test_metrics_store_compatibly_normalizes_legacy_recent_fields(self) -> None:
+        path = Path(self.temp_dir.name) / "legacy-state.json"
+        path.write_text(
+            json.dumps({"recent": [{"category": "responses", "result": "ok", "request_id": "legacy-secret"}]}),
+            encoding="utf-8",
+        )
+        store = gateway.MetricsStore(path)
+        store.record({"category": "responses", "result": "ok"})
+        state = json.loads(path.read_text(encoding="utf-8"))
+        legacy = state["recent"][0]
+        self.assertEqual(legacy["category"], "responses")
+        self.assertEqual(legacy["request_category"], "responses")
+        self.assertRegex(legacy["request_id"], r"^gw_[0-9a-f]{24}$")
+        self.assertNotIn("legacy-secret", json.dumps(state))
+        current = state["recent"][-1]
+        self.assertEqual(current["entrypoint"], "unknown")
+        self.assertEqual(current["user_agent_class"], "unknown")
+
     async def test_responses_midstream_timeout_emits_terminal_failure_event(self) -> None:
         self.mode = "midstream_timeout"
         response = await self.client.post("/v1/responses", json={"input": "timeout"})
@@ -339,6 +429,113 @@ class GatewayContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["token_accounting"]["invalid_samples"], 1)
         self.assertTrue(state["recent"][-1]["token_invalid"])
 
+    def test_token_header_parser_marks_non_numeric_values_invalid(self) -> None:
+        token = gateway._token_metrics(
+            {
+                "x-headroom-tokens-before": "100",
+                "x-headroom-tokens-after": "not-a-number",
+                "x-headroom-tokens-saved": "-1",
+            }
+        )
+        self.assertEqual(token, {"before": 100, "_invalid": 1})
+
+    def test_metrics_store_migrates_v1_missing_to_legacy_and_resets_current(self) -> None:
+        path = Path(self.temp_dir.name) / "v1-token-state.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "token_accounting": {
+                        "input_before": 100,
+                        "input_after": 60,
+                        "saved": 40,
+                        "completed_samples": 2,
+                        "missing_samples": 7,
+                        "invalid_samples": 1,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        store = gateway.MetricsStore(path)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        accounting = state["token_accounting"]
+        self.assertEqual(accounting["schema_version"], 2)
+        self.assertEqual(accounting["version"], 2)
+        self.assertEqual(accounting["completed_samples"], 0)
+        self.assertEqual(accounting["missing_samples"], 0)
+        self.assertEqual(accounting["invalid_samples"], 0)
+        self.assertEqual(accounting["legacy"]["missing_samples"], 7)
+        self.assertEqual(accounting["legacy"]["completed_samples"], 2)
+
+        store.record({"result": "ok", "token": {"before": 10, "after": 8, "saved": 2}})
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(state["token_accounting"]["completed_samples"], 1)
+        self.assertEqual(state["token_accounting"]["saved"], 2)
+        self.assertEqual(state["token_accounting"]["legacy"]["missing_samples"], 7)
+
+    def test_metrics_store_v2_eligibility_and_exclusions(self) -> None:
+        path = Path(self.temp_dir.name) / "v2-token-state.json"
+        store = gateway.MetricsStore(path)
+        store.record(
+            {
+                "result": "ok",
+                "request_class": "main",
+                "policy_mode": "compress",
+                "token": {"before": 100, "after": 80, "saved": 20},
+            }
+        )
+        store.record(
+            {
+                "result": "ok",
+                "request_class": "main",
+                "policy_mode": "compress",
+                "token": None,
+            }
+        )
+        store.record(
+            {
+                "result": "ok",
+                "request_class": "main",
+                "policy_mode": "compress",
+                "token": {"before": "bad", "after": "80", "saved": "20"},
+            }
+        )
+        store.record(
+            {
+                "result": "ok",
+                "request_class": "spawned",
+                "policy_mode": "bypass",
+                "token": {"before": 100, "after": 80, "saved": 20},
+            }
+        )
+        store.record(
+            {
+                "result": "upstream_unavailable",
+                "request_class": "main",
+                "policy_mode": "compress",
+                "token": None,
+            }
+        )
+        store.record(
+            {
+                "result": "ok",
+                "request_class": "main",
+                "policy_mode": "compress",
+                "fallback": "compression_passthrough",
+                "token": {"before": 0, "after": 0, "saved": 0},
+            }
+        )
+        state = json.loads(path.read_text(encoding="utf-8"))
+        accounting = state["token_accounting"]
+        self.assertEqual(accounting["completed_samples"], 2)
+        self.assertEqual(accounting["missing_samples"], 1)
+        self.assertEqual(accounting["invalid_samples"], 1)
+        self.assertEqual(accounting["input_before"], 100)
+        self.assertEqual(accounting["input_after"], 80)
+        self.assertEqual(accounting["saved"], 20)
+        self.assertEqual(accounting["excluded"], {"bypass": 1, "error": 1, "total": 2})
+
     async def test_metrics_store_tracks_exact_token_contract(self) -> None:
         path = Path(self.temp_dir.name) / "token-state.json"
         store = gateway.MetricsStore(path)
@@ -371,7 +568,10 @@ class GatewayContractTests(unittest.IsolatedAsyncioTestCase):
         store = gateway.MetricsStore(path)
         store.record({"result": "ok", "token": None})
         state = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(state["token_accounting"]["invalid_samples"], 1)
+        self.assertEqual(state["token_accounting"]["schema_version"], 2)
+        self.assertEqual(state["token_accounting"]["invalid_samples"], 0)
+        self.assertEqual(state["token_accounting"]["missing_samples"], 1)
+        self.assertEqual(state["token_accounting"]["legacy"]["invalid_samples"], 1)
 
         missing_path = Path(self.temp_dir.name) / "missing-token-state.json"
         missing_path.write_text(
@@ -523,6 +723,9 @@ class GatewayContractTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/health")
         self.assertEqual(response.status_code, 503)
         self.assertFalse(response.json()["ready"])
+        health_client = FakeAsyncClient.instances[-1]
+        self.assertFalse(health_client.init_kwargs["trust_env"])
+        self.assertAlmostEqual(health_client.init_kwargs["timeout"].connect, 0.2)
 
     async def test_connect_error_before_connect_falls_back_once(self) -> None:
         self.mode = "headroom_connect_error"
@@ -587,6 +790,26 @@ class GatewayContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["passthrough"])
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["recent"][-1]["fallback"], "compression_passthrough")
+        self.assertEqual(state["token_accounting"]["completed_samples"], 1)
+        self.assertEqual(state["token_accounting"]["missing_samples"], 0)
+        self.assertEqual(state["token_accounting"]["excluded"]["total"], 0)
+
+    async def test_gateway_bypass_and_upstream_error_are_excluded_from_token_v2(self) -> None:
+        response = await self.client.post(
+            "/v1/responses",
+            headers={"x-openai-subagent": "collab_spawn"},
+            json={"input": "spawned"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.mode = "upstream_500"
+        response = await self.client.post("/v1/responses", json={"input": "error"})
+        self.assertEqual(response.status_code, 502)
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        accounting = state["token_accounting"]
+        self.assertEqual(accounting["completed_samples"], 0)
+        self.assertEqual(accounting["missing_samples"], 0)
+        self.assertEqual(accounting["invalid_samples"], 0)
+        self.assertEqual(accounting["excluded"], {"bypass": 1, "error": 1, "total": 2})
 
     async def test_livez_is_process_only_and_headroom_strips_bypass(self) -> None:
         response = await self.client.get("/livez")

@@ -21,6 +21,7 @@ $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('headroom-activation-fixtur
 try {
     $startScriptContent = Get-Content -LiteralPath (Join-Path $root 'start-headroom.ps1') -Raw
     $ensureScriptContent = Get-Content -LiteralPath (Join-Path $root 'ensure-headroom.ps1') -Raw
+    $pythonLauncherContent = Get-Content -LiteralPath (Join-Path $root 'headroom-launcher.py') -Raw
     $launcherVbsContent = Get-Content -LiteralPath (Join-Path $root 'start-headroom-launcher.vbs') -Raw
     $legacyVbsContent = Get-Content -LiteralPath (Join-Path $root 'headroom-18787.vbs') -Raw
     Assert-ActivationTrue -Condition ($startScriptContent -match 'HEADROOM_KOMPRESS_TIME_BUDGET_SECONDS' -and $startScriptContent -match 'HEADROOM_PIPELINE_BREAKER_THRESHOLD' -and $startScriptContent -match 'HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE') -Name 'direct Headroom launch configures kompress time budget, pipeline breaker, and WS fail-open'
@@ -29,9 +30,15 @@ try {
     Assert-ActivationTrue -Condition ($ensureScriptContent -notmatch 'HEADROOM_KOMPRESS_ONNX_INTRA_THREADS\s*=') -Name 'ensure Headroom launch leaves ONNX intra threads at the runtime default'
     Assert-ActivationTrue -Condition ($startScriptContent -match 'HEADROOM_KOMPRESS_MAX_CONCURRENT\s*=\s*''1''') -Name 'direct Headroom launch serializes Kompress requests'
     Assert-ActivationTrue -Condition ($ensureScriptContent -match 'HEADROOM_KOMPRESS_MAX_CONCURRENT\s*=\s*''1''') -Name 'ensure Headroom launch serializes Kompress requests'
+    Assert-ActivationTrue -Condition ($startScriptContent -match 'HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM\s*=\s*''1''') -Name 'direct Headroom launch aligns Responses unit concurrency with one broker worker'
+    Assert-ActivationTrue -Condition ($ensureScriptContent -match 'HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM\s*=\s*''1''') -Name 'ensure Headroom launch aligns Responses unit concurrency with one broker worker'
+    Assert-ActivationTrue -Condition ($pythonLauncherContent -match 'os\.environ\["HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM"\]\s*=\s*"1"') -Name 'Python launcher force-pins direct invocations to the serialized Responses unit contract'
+    Assert-ActivationTrue -Condition ($startScriptContent -match 'runtime_contract_sha256' -and $startScriptContent -match 'Get-HeadroomRuntimeContractHash') -Name 'direct Headroom state binds the runtime source and environment contract'
+    Assert-ActivationTrue -Condition ($ensureScriptContent -match 'runtime_contract_sha256' -and $ensureScriptContent -match 'Test-StateCompatibility -State \$state' -and $ensureScriptContent -notmatch 'retaining legacy state contract') -Name 'ensure restarts a healthy listener when the runtime contract is stale'
     Assert-ActivationTrue -Condition ($startScriptContent -match '\[ValidateSet\(1, 2\)\]' -and $startScriptContent -match '\$Workers\s*=\s*1' -and $startScriptContent -match "'--workers'," -and $startScriptContent -match '\$Workers') -Name 'direct Headroom launch uses a stable single-worker contract by default'
     Assert-ActivationTrue -Condition ($ensureScriptContent -match '\$Workers\s*=\s*1' -and $ensureScriptContent -match '-Workers \$Workers') -Name 'ensure Headroom propagates the stable worker contract'
     Assert-ActivationTrue -Condition ($startScriptContent -notmatch '(?i)--no-optimize|--disable-kompress') -Name 'direct Headroom launch does not disable optimization'
+    Assert-ActivationTrue -Condition ($startScriptContent -match 'HEADROOM_MODE\s*=\s*''cache''' -and $ensureScriptContent -match '\$env:HEADROOM_MODE\s*=\s*''cache''' -and $startScriptContent -notmatch 'HEADROOM_FORCE_KOMPRESS_ALL\s*=\s*''1''') -Name 'production launch keeps cache-safe compression mode without forcing every content type through Kompress'
     Assert-ActivationTrue -Condition ($launcherVbsContent -match 'Launch-HeadroomForCodexPP\.vbs' -and $launcherVbsContent -notmatch 'start-headroom\.ps1|headroom\.exe|--no-optimize|--disable-kompress') -Name 'legacy launcher VBS delegates only to the root entry'
     Assert-ActivationTrue -Condition ($legacyVbsContent -match 'Launch-HeadroomForCodexPP\.vbs' -and $legacyVbsContent -notmatch 'start-headroom\.ps1|headroom\.exe|--no-optimize|--disable-kompress') -Name 'legacy VBS delegates only to the root entry'
 

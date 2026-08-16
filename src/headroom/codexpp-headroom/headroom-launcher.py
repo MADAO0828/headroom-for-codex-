@@ -37,6 +37,7 @@ def _warm_kompress() -> None:
     os.environ.setdefault("HEADROOM_ONNX_CPU_ARENA", "1")
     os.environ.setdefault("HEADROOM_KOMPRESS_ONNX_INTRA_THREADS", "12")
     os.environ.setdefault("HEADROOM_KOMPRESS_ONNX_INTER_THREADS", "1")
+    os.environ["HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM"] = "1"
     try:
         from headroom.transforms.kompress_compressor import warm_kompress_model
 
@@ -69,6 +70,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "HEADROOM_KOMPRESS_ONNX_INTRA_THREADS",
         "12" if worker_count <= 1 else "8",
     )
+    os.environ["HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM"] = "1"
     # With Uvicorn workers, this process is the supervisor. Each serving
     # worker runs Headroom's own startup preload, so warming here would retain
     # an unused third ONNX session for a two-worker launch.

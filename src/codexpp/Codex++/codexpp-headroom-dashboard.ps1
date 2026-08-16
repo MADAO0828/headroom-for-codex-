@@ -143,6 +143,14 @@ function ConvertTo-UtcTimestamp {
     return $parsed.ToUniversalTime()
 }
 
+function ConvertTo-LocalTimestamp {
+    param([AllowNull()][object]$Value)
+
+    $utc = ConvertTo-UtcTimestamp -Value $Value
+    if ($null -eq $utc) { return [string]$Value }
+    return ([DateTimeOffset]$utc).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
+}
+
 function Get-ErrorFingerprint {
     param([AllowNull()][string]$Message)
 
@@ -184,6 +192,7 @@ function New-ErrorSnapshot {
         (New-StatusRow -Key 'headroom-health' -Label 'Headroom health' -State Red -Detail $Message),
         (New-StatusRow -Key 'relay' -Label 'Relay' -State Red -Detail $Message),
         (New-StatusRow -Key 'route' -Label '客户端路由' -State Red -Detail $Message),
+        (New-StatusRow -Key 'official-dataplane' -Label '官方数据面' -State Red -Detail $Message),
         (New-StatusRow -Key 'codex-connection' -Label 'Codex 连接' -State Red -Detail $Message),
         (New-StatusRow -Key 'api' -Label 'HTTP API' -State Red -Detail $Message),
         (New-StatusRow -Key 'transport' -Label '传输与错误' -State Red -Detail $Message),
@@ -193,11 +202,11 @@ function New-ErrorSnapshot {
     )
     foreach ($row in $rows) {
         $row | Add-Member -NotePropertyName Summary -NotePropertyValue '统一接口不可用' -Force
-        $row | Add-Member -NotePropertyName ObservedAt -NotePropertyValue (Get-Date).ToUniversalTime().ToString('o') -Force
+        $row | Add-Member -NotePropertyName ObservedAt -NotePropertyValue (ConvertTo-LocalTimestamp -Value (Get-Date).ToUniversalTime().ToString('o')) -Force
     }
     return [pscustomobject]@{
         OverallState = 'Red'
-        CheckedAt = (Get-Date).ToUniversalTime().ToString('o')
+        CheckedAt = (ConvertTo-LocalTimestamp -Value (Get-Date).ToUniversalTime().ToString('o'))
         Description = (ConvertTo-SafeText $Message)
         Rows = $rows
         Traffic = $null
@@ -258,7 +267,7 @@ function Get-DashboardSnapshot {
         foreach ($name in $required) {
             if ($null -eq $status.PSObject.Properties[$name]) { return New-ErrorSnapshot -Message '监控数据不兼容' }
         }
-        $expectedKeys = @('gateway-livez', 'gateway-health', 'headroom-livez', 'headroom-health', 'relay', 'route', 'codex-connection', 'api', 'transport', 'kompress', 'token-accounting', 'monitor-core')
+        $expectedKeys = @('gateway-livez', 'gateway-health', 'headroom-livez', 'headroom-health', 'relay', 'route', 'official-dataplane', 'codex-connection', 'api', 'transport', 'kompress', 'token-accounting', 'monitor-core')
         $itemRequired = @('key', 'label', 'state', 'summary', 'detail', 'observed_at', 'source')
         $validStates = @('green', 'yellow', 'red', 'gray')
         $items = @($status.items)
@@ -314,7 +323,7 @@ function Get-DashboardSnapshot {
                 $bypassDetail = [string](Get-ObjectProperty -Object $_ -Name 'bypass_detail')
                 $row = New-StatusRow -Key ([string]$_.key) -Label ([string]$_.label) -State $state -Detail ([string]$_.detail) -BypassDetail $bypassDetail
                 $row | Add-Member -NotePropertyName Summary -NotePropertyValue ([string]$_.summary) -Force
-                $row | Add-Member -NotePropertyName ObservedAt -NotePropertyValue ([string]$_.observed_at) -Force
+        $row | Add-Member -NotePropertyName ObservedAt -NotePropertyValue (ConvertTo-LocalTimestamp -Value $_.observed_at) -Force
                 $row
             })
         $overall = switch ([string]$status.overall) {
@@ -336,7 +345,7 @@ function Get-DashboardSnapshot {
         }
         return [pscustomobject]@{
             OverallState = $overall
-            CheckedAt = [string]$status.generated_at
+            CheckedAt = (ConvertTo-LocalTimestamp -Value $status.generated_at)
             Description = $description
             Rows = $rows
             Traffic = $status.metrics.traffic
@@ -568,12 +577,12 @@ try {
     $table.Location = [Drawing.Point]::new(12, 92)
     $table.Size = [Drawing.Size]::new(416, 400)
     $table.ColumnCount = 3
-    $table.RowCount = 12
+    $table.RowCount = 13
     [void]$table.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new([Windows.Forms.SizeType]::Absolute, 30))
     [void]$table.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new([Windows.Forms.SizeType]::Absolute, 154))
     [void]$table.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new([Windows.Forms.SizeType]::Percent, 100))
-    for ($i = 0; $i -lt 12; $i++) {
-        [void]$table.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 33))
+    for ($i = 0; $i -lt 13; $i++) {
+        [void]$table.RowStyles.Add([Windows.Forms.RowStyle]::new([Windows.Forms.SizeType]::Absolute, 30))
     }
     $initialRows = @(
         @{ Key = 'gateway-livez'; Label = 'Gateway livez' },
@@ -582,6 +591,7 @@ try {
         @{ Key = 'headroom-health'; Label = 'Headroom health' },
         @{ Key = 'relay'; Label = 'Relay' },
         @{ Key = 'route'; Label = '客户端路由' },
+        @{ Key = 'official-dataplane'; Label = '官方数据面' },
         @{ Key = 'codex-connection'; Label = 'Codex 连接' },
         @{ Key = 'api'; Label = 'HTTP API' },
         @{ Key = 'transport'; Label = '传输与错误' },

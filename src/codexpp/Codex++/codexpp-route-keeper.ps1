@@ -84,6 +84,104 @@ function Get-ObjectProperty {
     return $property.Value
 }
 
+function Get-ConfigProtectedContract {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [AllowNull()][string]$FallbackPath = $null
+    )
+    $empty = [ordered]@{
+        Exists = $false
+        Provider = $null
+        ProviderPresent = $false
+        ProviderSectionSha256 = $null
+        BaseUrlPresent = $false
+        BaseUrl = $null
+        WireApiPresent = $false
+        WireApi = $null
+        RequiresOpenAIAuthPresent = $false
+        RequiresOpenAIAuth = $null
+        ExperimentalBearerTokenPresent = $false
+        ProtectedContractSha256 = $null
+        Error = 'config_missing'
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [pscustomobject]$empty }
+    try {
+        $content = [IO.File]::ReadAllText($Path)
+        $providerMatch = [regex]::Match($content, '(?im)^\s*model_provider\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+        $usedFallback = $false
+        if (-not $providerMatch.Success -and -not [string]::IsNullOrWhiteSpace($FallbackPath) -and (Test-Path -LiteralPath $FallbackPath -PathType Leaf)) {
+            $content = [IO.File]::ReadAllText($FallbackPath)
+            $providerMatch = [regex]::Match($content, '(?im)^\s*model_provider\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+            $usedFallback = $providerMatch.Success
+        }
+        if (-not $providerMatch.Success) { $empty.Exists = $true; $empty.Error = 'root_model_provider_missing'; return [pscustomobject]$empty }
+        $provider = if ($providerMatch.Groups['double'].Success) { $providerMatch.Groups['double'].Value } else { $providerMatch.Groups['single'].Value }
+        $sectionMatch = [regex]::Match($content, '(?ims)^\s*\[model_providers\.' + [regex]::Escape($provider) + '\]\s*(?<section>.*?)(?=^\s*\[|\z)')
+        if (-not $sectionMatch.Success) { $empty.Exists = $true; $empty.Provider = $provider; $empty.ProviderPresent = $true; $empty.Error = 'provider_section_missing'; return [pscustomobject]$empty }
+        $section = $sectionMatch.Groups['section'].Value
+        $baseMatch = [regex]::Match($section, '(?im)^\s*base_url\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+        $wireMatch = [regex]::Match($section, '(?im)^\s*wire_api\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+        $authMatch = [regex]::Match($section, '(?im)^\s*requires_openai_auth\s*=\s*(?<value>true|false)\s*(?:#.*)?$')
+        $tokenMatch = [regex]::Match($section, '(?im)^\s*experimental_bearer_token\s*=')
+        $basePresent = $baseMatch.Success
+        $wirePresent = $wireMatch.Success
+        $authPresent = $authMatch.Success
+        $tokenPresent = $tokenMatch.Success
+        $baseUrl = if ($basePresent) { if ($baseMatch.Groups['double'].Success) { $baseMatch.Groups['double'].Value } else { $baseMatch.Groups['single'].Value } } else { $null }
+        $wireApi = if ($wirePresent) { if ($wireMatch.Groups['double'].Success) { $wireMatch.Groups['double'].Value } else { $wireMatch.Groups['single'].Value } } else { $null }
+        $requiresAuth = if ($authPresent) { $authMatch.Groups['value'].Value.ToLowerInvariant() } else { $null }
+        $canonical = @(
+            "provider_present=1"
+            "provider=$provider"
+            "base_url_present=$([int][bool]$basePresent)"
+            "base_url=$baseUrl"
+            "wire_api_present=$([int][bool]$wirePresent)"
+            "wire_api=$wireApi"
+            "requires_openai_auth_present=$([int][bool]$authPresent)"
+            "requires_openai_auth=$requiresAuth"
+            "bearer_token_present=$([int][bool]$tokenPresent)"
+        ) -join "`n"
+        $fingerprint = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($canonical)))).Replace('-', '')
+        return [pscustomobject]@{
+            Exists = $true
+            Provider = $provider
+            ProviderPresent = $true
+            ProviderSectionSha256 = $fingerprint
+            BaseUrlPresent = $basePresent
+            BaseUrl = $baseUrl
+            WireApiPresent = $wirePresent
+            WireApi = $wireApi
+            RequiresOpenAIAuthPresent = $authPresent
+            RequiresOpenAIAuth = $requiresAuth
+            ExperimentalBearerTokenPresent = $tokenPresent
+            ProtectedContractSha256 = $fingerprint
+            UsedFallback = $usedFallback
+            Error = if (-not $basePresent) { 'base_url_missing' } elseif (-not $wirePresent) { 'wire_api_missing' } else { $null }
+        }
+    }
+    catch {
+        $empty.Exists = $true
+        $empty.Error = 'config_read_error'
+        return [pscustomobject]$empty
+    }
+}
+
+function Test-ConfigProtectedContract {
+    param([Parameter(Mandatory)][object]$Before,[Parameter(Mandatory)][object]$After)
+    if (-not $Before.Exists -or -not $After.Exists -or $null -ne $Before.Error -or $null -ne $After.Error) { return $false }
+    return (
+        [bool]$Before.ProviderPresent -eq [bool]$After.ProviderPresent -and
+        [string]$Before.Provider -eq [string]$After.Provider -and
+        [bool]$Before.BaseUrlPresent -eq [bool]$After.BaseUrlPresent -and
+        [string]$Before.BaseUrl -eq [string]$After.BaseUrl -and
+        [bool]$Before.WireApiPresent -eq [bool]$After.WireApiPresent -and
+        [string]$Before.WireApi -eq [string]$After.WireApi -and
+        [bool]$Before.RequiresOpenAIAuthPresent -eq [bool]$After.RequiresOpenAIAuthPresent -and
+        [string]$Before.RequiresOpenAIAuth -eq [string]$After.RequiresOpenAIAuth -and
+        [bool]$Before.ExperimentalBearerTokenPresent -eq [bool]$After.ExperimentalBearerTokenPresent
+    )
+}
+
 function ConvertTo-StatsNumber {
     param([AllowNull()][object]$Value)
     if ($null -eq $Value -or $Value -is [bool]) { return $null }
@@ -125,7 +223,8 @@ function Write-RouteState {
         [string]$ErrorCode = '',
         [string]$Stage = 'route_keeper',
         [string]$Provider = '',
-        [string]$ProcessRouteBaseUrl = ''
+        [string]$ProcessRouteBaseUrl = '',
+        [AllowNull()][object]$ProtectedContract = $null
     )
     $script:RouteStateWriteFailed = $false
     try {
@@ -134,6 +233,21 @@ function Write-RouteState {
         $effectiveErrorCode = if ($Status -eq 'failed') {
             if ([string]::IsNullOrWhiteSpace($ErrorCode)) { ConvertTo-ErrorCode $Reason } else { ConvertTo-ErrorCode $ErrorCode }
         } else { '' }
+        $protectedRecord = $null
+        if ($null -ne $ProtectedContract) {
+            $protectedRecord = [ordered]@{
+                provider_present = [bool](Get-ObjectProperty $ProtectedContract 'ProviderPresent')
+                provider = [string](Get-ObjectProperty $ProtectedContract 'Provider')
+                base_url_present = [bool](Get-ObjectProperty $ProtectedContract 'BaseUrlPresent')
+                base_url = [string](Get-ObjectProperty $ProtectedContract 'BaseUrl')
+                wire_api_present = [bool](Get-ObjectProperty $ProtectedContract 'WireApiPresent')
+                wire_api = [string](Get-ObjectProperty $ProtectedContract 'WireApi')
+                requires_openai_auth_present = [bool](Get-ObjectProperty $ProtectedContract 'RequiresOpenAIAuthPresent')
+                requires_openai_auth = [string](Get-ObjectProperty $ProtectedContract 'RequiresOpenAIAuth')
+                bearer_token_present = [bool](Get-ObjectProperty $ProtectedContract 'ExperimentalBearerTokenPresent')
+                fingerprint = [string](Get-ObjectProperty $ProtectedContract 'ProtectedContractSha256')
+            }
+        }
         $document = [ordered]@{
             schema_version = $script:RouteStateSchemaVersion
             route_contract_version = $script:RouteContractVersion
@@ -152,6 +266,7 @@ function Write-RouteState {
             config_path = $ConfigPath
             config_mutated = $false
             route_scope = 'process'
+            config_protected_contract = $protectedRecord
             allow_relay_pending = [bool]$AllowRelayPending
             process_route_base_url = $ProcessRouteBaseUrl
             provider = $Provider
@@ -314,9 +429,18 @@ function Test-ReadySignal {
 }
 
 function ConvertTo-ConfigText {
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path,[AllowNull()][string]$FallbackPath = $null)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'config_missing' }
-    return Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    $text = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    # Under Codex++ aggregate mode the Manager's config.toml may carry no
+    # model_provider section; the active supplier contract lives in the
+    # official home.  Fall back so route-mode reconciliation and the
+    # protected contract remain verifiable.
+    $providerProbe = [regex]::Matches($text, '(?im)^\s*model_provider\s*=\s*(?:"(?<double>[^"]*)"|''(?<single>[^'']*)'')\s*(?:#.*)?$')
+    if ($providerProbe.Count -ne 1 -and -not [string]::IsNullOrWhiteSpace($FallbackPath) -and (Test-Path -LiteralPath $FallbackPath -PathType Leaf)) {
+        return Get-Content -LiteralPath $FallbackPath -Raw -ErrorAction Stop
+    }
+    return $text
 }
 
 function Get-ProviderId {
@@ -369,7 +493,7 @@ function Get-ActiveProviderWireApi {
 
 function Test-ActiveProxyContract {
     try {
-        $text = ConvertTo-ConfigText -Path $ConfigPath
+        $text = ConvertTo-ConfigText -Path $ConfigPath -FallbackPath 'C:\Users\ma dao\.codex\config.toml'
         $provider = Get-ProviderId $text
         $base = Get-ActiveProviderBaseUrl $text
         $supports = Get-ActiveProviderSupportsWebsockets $text
@@ -381,9 +505,11 @@ function Test-ActiveProxyContract {
 
 function Get-ConfigSnapshot {
     try {
-        $text = ConvertTo-ConfigText -Path $ConfigPath
+        $text = ConvertTo-ConfigText -Path $ConfigPath -FallbackPath 'C:\Users\ma dao\.codex\config.toml'
         $provider = Get-ProviderId $text
         $hash = (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash
+        $protected = Get-ConfigProtectedContract -Path $ConfigPath -FallbackPath 'C:\Users\ma dao\.codex\config.toml'
+        if (-not $protected.Exists -or $null -ne $protected.Error) { throw $protected.Error }
         return [pscustomobject]@{
             Ready = $true
             Hash = $hash
@@ -391,16 +517,28 @@ function Get-ConfigSnapshot {
             BaseUrl = Get-ActiveProviderBaseUrl $text
             Supports = Get-ActiveProviderSupportsWebsockets $text
             WireApi = Get-ActiveProviderWireApi $text
+            Protected = $protected
         }
     }
     catch {
-        return [pscustomobject]@{ Ready = $false; Hash = ''; Provider = ''; BaseUrl = $null; Supports = [pscustomobject]@{ Present = $false; Value = $null }; WireApi = $null; Error = (ConvertTo-ErrorCode $_.Exception.Message) }
+        return [pscustomobject]@{ Ready = $false; Hash = ''; Provider = ''; BaseUrl = $null; Supports = [pscustomobject]@{ Present = $false; Value = $null }; WireApi = $null; Protected = $null; Error = (ConvertTo-ErrorCode $_.Exception.Message) }
     }
 }
 
 function Get-RouteStateDocument {
     if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) { return $null }
     try { return Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json } catch { return $null }
+}
+
+function Test-RouteStateProtectedContract {
+    param([Parameter(Mandatory)][object]$Snapshot)
+    $state = Get-RouteStateDocument
+    if ($null -eq $state) { return $null }
+    $stateProtected = Get-ObjectProperty $state 'config_protected_contract'
+    if ($null -eq $stateProtected) { return $null }
+    $snapshotProtected = Get-ObjectProperty $Snapshot 'Protected'
+    if ($null -eq $snapshotProtected) { return $false }
+    return [string]$stateProtected.fingerprint -eq [string](Get-ObjectProperty $snapshotProtected 'ProtectedContractSha256')
 }
 
 function Write-RouteHeartbeat {
@@ -414,13 +552,14 @@ function Write-RouteHeartbeat {
     $expectedStatus = if ($EffectiveMode -eq 'official') { 'official-bypass' } else { 'ready' }
     $expectedProcessRouteBaseUrl = if ($EffectiveMode -eq 'official') { [string]$Snapshot.BaseUrl } else { $ProxyBaseUrl }
     $stateKeeperPid = ConvertTo-StatsNumber (Get-ObjectProperty $state 'route_keeper_pid')
+    $stateProtected = Get-ObjectProperty $state 'config_protected_contract'
+    $snapshotProtected = Get-ObjectProperty $Snapshot 'Protected'
     $stateMatches = (
         [int](Get-ObjectProperty $state 'schema_version') -eq $script:RouteStateSchemaVersion -and
         [int](Get-ObjectProperty $state 'route_contract_version') -eq $script:RouteContractVersion -and
         [string](Get-ObjectProperty $state 'status') -eq $expectedStatus -and
         [string](Get-ObjectProperty $state 'route_scope') -eq 'process' -and
         (Get-ObjectProperty $state 'config_mutated') -eq $false -and
-        [string](Get-ObjectProperty $state 'config_sha256') -eq [string]$Snapshot.Hash -and
         [string](Get-ObjectProperty $state 'provider') -eq [string]$Snapshot.Provider -and
         [string](Get-ObjectProperty $state 'process_route_base_url') -eq $expectedProcessRouteBaseUrl -and
         $null -ne $stateKeeperPid -and [int]$stateKeeperPid -eq [int]$PID -and
@@ -434,8 +573,34 @@ function Write-RouteHeartbeat {
         [string](Get-ObjectProperty $state 'route_keeper_proxy_base_url') -eq $ProxyBaseUrl
     )
     if (-not $stateMatches) { return $false }
+    # A missing contract is accepted only for a legacy state whose full hash
+    # still matches.  On ordinary metadata drift the watcher will fall back
+    # to Ensure-RouteOnce, which publishes the new contract before the next
+    # heartbeat.  New state always carries the field-level contract.
+    if ($null -ne $stateProtected) {
+        if ($null -eq $snapshotProtected -or [string]$stateProtected.fingerprint -ne [string](Get-ObjectProperty $snapshotProtected 'ProtectedContractSha256')) { return $false }
+    }
+    elseif ([string](Get-ObjectProperty $state 'config_sha256') -ne [string]$Snapshot.Hash) {
+        return $false
+    }
 
     $state.timestamp_utc = [DateTime]::UtcNow.ToString('o')
+    $state.config_sha256 = [string]$Snapshot.Hash
+    $state.config_protected_contract = if ($null -ne $snapshotProtected) {
+        [ordered]@{
+            provider_present = [bool](Get-ObjectProperty $snapshotProtected 'ProviderPresent')
+            provider = [string](Get-ObjectProperty $snapshotProtected 'Provider')
+            base_url_present = [bool](Get-ObjectProperty $snapshotProtected 'BaseUrlPresent')
+            base_url = [string](Get-ObjectProperty $snapshotProtected 'BaseUrl')
+            wire_api_present = [bool](Get-ObjectProperty $snapshotProtected 'WireApiPresent')
+            wire_api = [string](Get-ObjectProperty $snapshotProtected 'WireApi')
+            requires_openai_auth_present = [bool](Get-ObjectProperty $snapshotProtected 'RequiresOpenAIAuthPresent')
+            requires_openai_auth = [string](Get-ObjectProperty $snapshotProtected 'RequiresOpenAIAuth')
+            bearer_token_present = [bool](Get-ObjectProperty $snapshotProtected 'ExperimentalBearerTokenPresent')
+            fingerprint = [string](Get-ObjectProperty $snapshotProtected 'ProtectedContractSha256')
+        }
+    } else { $null }
+    $state.provider = [string]$Snapshot.Provider
     $state.route_keeper_pid = [int]$PID
     $state.route_keeper_script_path = $script:RouteKeeperScriptPath
     $state.route_keeper_started_at = $script:RouteKeeperStartedAt.ToString('o')
@@ -550,27 +715,27 @@ function Ensure-RouteOnce {
     if ($effectiveRequestedMode -eq 'official') { $relayMode = [pscustomobject]@{ Valid = $true; Mode = 'official'; Protocol = $relayMode.Protocol; RequiresProxy = $false; Error = $null } }
     if (-not $relayMode.RequiresProxy) {
         if ($snapshot.BaseUrl -eq $ProxyBaseUrl) {
-            Write-RouteState -Mode 'official' -Protocol $relayMode.Protocol -Action 'fail-closed' -Status 'failed' -Reason 'official_bypass_config_is_local' -ConfigHash $snapshot.Hash -Provider $snapshot.Provider -ProcessRouteBaseUrl ''
+            Write-RouteState -Mode 'official' -Protocol $relayMode.Protocol -Action 'fail-closed' -Status 'failed' -Reason 'official_bypass_config_is_local' -ConfigHash $snapshot.Hash -Provider $snapshot.Provider -ProcessRouteBaseUrl '' -ProtectedContract $snapshot.Protected
             throw 'official_bypass_config_is_local'
         }
-        Write-RouteState -Mode 'official' -Protocol $relayMode.Protocol -Action 'validate' -Status 'official-bypass' -Reason 'official account mode remains direct; config was not modified' -ConfigHash $snapshot.Hash -Provider $snapshot.Provider -ProcessRouteBaseUrl $snapshot.BaseUrl
+        Write-RouteState -Mode 'official' -Protocol $relayMode.Protocol -Action 'validate' -Status 'official-bypass' -Reason 'official account mode remains direct; config was not modified' -ConfigHash $snapshot.Hash -Provider $snapshot.Provider -ProcessRouteBaseUrl $snapshot.BaseUrl -ProtectedContract $snapshot.Protected
         Assert-RouteStateWritten
         Write-Result $relayMode 'validate' 'official-bypass' $snapshot.Hash
         return
     }
     $headroomReadiness = Get-HeadroomRouteReadiness -AllowRelayPending:$AllowRelayPending
     if (-not $headroomReadiness.Ready) {
-        Write-RouteState -Mode $relayMode.Mode -Protocol $relayMode.Protocol -Action 'fail-closed' -Status 'failed' -Reason $headroomReadiness.Reason -ErrorCode $headroomReadiness.Reason -ConfigHash $snapshot.Hash -Provider $snapshot.Provider -ProcessRouteBaseUrl $ProxyBaseUrl
+        Write-RouteState -Mode $relayMode.Mode -Protocol $relayMode.Protocol -Action 'fail-closed' -Status 'failed' -Reason $headroomReadiness.Reason -ErrorCode $headroomReadiness.Reason -ConfigHash $snapshot.Hash -Provider $snapshot.Provider -ProcessRouteBaseUrl $ProxyBaseUrl -ProtectedContract $snapshot.Protected
         throw $headroomReadiness.Reason
     }
     if ($snapshot.WireApi -ne 'responses') {
-        Write-RouteState -Mode $relayMode.Mode -Protocol $relayMode.Protocol -Action 'fail-closed' -Status 'failed' -Reason 'config_wire_api_incompatible' -ErrorCode 'config_wire_api_incompatible' -ConfigHash $snapshot.Hash -Provider $snapshot.Provider -ProcessRouteBaseUrl $ProxyBaseUrl
+        Write-RouteState -Mode $relayMode.Mode -Protocol $relayMode.Protocol -Action 'fail-closed' -Status 'failed' -Reason 'config_wire_api_incompatible' -ErrorCode 'config_wire_api_incompatible' -ConfigHash $snapshot.Hash -Provider $snapshot.Provider -ProcessRouteBaseUrl $ProxyBaseUrl -ProtectedContract $snapshot.Protected
         throw 'config_wire_api_incompatible'
     }
     $routeStatus = if ($headroomReadiness.Pending) { 'pending' } else { 'ready' }
     $routeAction = if ($headroomReadiness.Pending) { 'process-route-pending' } else { 'process-route' }
     $routeReason = if ($headroomReadiness.Pending) { 'Gateway live; helper 57321 pending, process route override published without config mutation' } else { 'Headroom/Gateway ready; process route override published without config mutation' }
-    Write-RouteState -Mode $relayMode.Mode -Protocol $relayMode.Protocol -Action $routeAction -Status $routeStatus -Reason $routeReason -ConfigHash $snapshot.Hash -Provider $snapshot.Provider -ProcessRouteBaseUrl $ProxyBaseUrl
+    Write-RouteState -Mode $relayMode.Mode -Protocol $relayMode.Protocol -Action $routeAction -Status $routeStatus -Reason $routeReason -ConfigHash $snapshot.Hash -Provider $snapshot.Provider -ProcessRouteBaseUrl $ProxyBaseUrl -ProtectedContract $snapshot.Protected
     Assert-RouteStateWritten
     Write-Result $relayMode $routeAction $routeStatus $snapshot.Hash
 }
@@ -623,8 +788,18 @@ try {
             $relayMode = Get-RelayMode
             $effectiveMode = if ($Mode -eq 'auto') { if ($relayMode.RequiresProxy) { 'proxy' } else { 'official' } } else { $Mode }
             if (-not $snapshot.Ready -or -not $relayMode.Valid) { throw (if ($snapshot.Ready) { $relayMode.Error } else { $snapshot.Error }) }
-            if ($snapshot.Hash -ne $lastHash -or $effectiveMode -ne $lastMode) {
-                Ensure-RouteOnce
+            $hashChanged = $snapshot.Hash -ne $lastHash
+            $modeChanged = $effectiveMode -ne $lastMode
+            if ($hashChanged -or $modeChanged) {
+                $protectedMatches = Test-RouteStateProtectedContract -Snapshot $snapshot
+                if ($protectedMatches -eq $false) { throw 'config_protected_contract_changed' }
+                $heartbeatUpdated = $false
+                if ($hashChanged -and -not $modeChanged) {
+                    $heartbeatUpdated = Write-RouteHeartbeat -Snapshot $snapshot -EffectiveMode $effectiveMode
+                }
+                if (-not $heartbeatUpdated) {
+                    Ensure-RouteOnce
+                }
                 Write-ReadySignal
                 $lastHash = $snapshot.Hash
                 $lastMode = $effectiveMode

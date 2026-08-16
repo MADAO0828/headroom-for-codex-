@@ -87,6 +87,8 @@ $script:RelayPort = 57321
 $script:HttpTimeoutSeconds = 15
 $script:TcpTimeoutMs = 1500
 $script:CodexPlusPlusConfigPath = 'C:\Users\ma dao\.codex-plus-plus-cli\config.toml'
+$script:CodexPlusPlusExecutablePath = [IO.Path]::GetFullPath('D:\program\Codex++\codex-plus-plus.exe')
+$script:CodexPlusPlusManagerExecutablePath = [IO.Path]::GetFullPath('D:\program\Codex++\codex-plus-plus-manager.exe')
 $script:CodexConfigPath = 'C:\Users\ma dao\.codex\config.toml'
 $script:RouteStatePath = Join-Path $script:RuntimeStateRoot 'codexpp-route-state.json'
 $script:RouteKeeperPath = Join-Path $PSScriptRoot 'codexpp-route-keeper.ps1'
@@ -117,6 +119,7 @@ $script:LastWarningAt = $null
 $script:LastPopupFingerprint = $null
 $script:LastPopupAt = $null
 $script:TrafficBaseline = $null
+$script:OfficialDataplaneGatewayBaseline = $null
 $script:HasSuccessfulModelRequest = $false
 $script:HasUnrecoveredModelFailure = $false
 $script:MonitorInstanceId = [Guid]::NewGuid().ToString('N')
@@ -124,6 +127,7 @@ $script:MonitorStartedAt = [DateTime]::UtcNow
 $script:HasObservedOwner = $false
 $script:PrelaunchGraceActive = $false
 $script:CompressionQueueTimeoutBaseline = $null
+$script:KompressBrokerCounterBaseline = $null
 $script:WatchMode = $Watch -or (-not $Once)
 
 function ConvertTo-SafeText {
@@ -252,7 +256,7 @@ function Write-MonitorState {
         }
         $statusDocument = if ($null -ne $UnifiedStatus) { $UnifiedStatus } else { $script:UnifiedStatus }
         if ($null -ne $statusDocument) {
-            foreach ($name in @('schema_version', 'generated_at', 'stale_after_seconds', 'overall', 'items', 'metrics', 'active_issues', 'recent_recoveries')) {
+            foreach ($name in @('schema_version', 'generated_at', 'stale_after_seconds', 'overall', 'items', 'metrics', 'official_dataplane', 'active_issues', 'recent_recoveries')) {
                 $property = $statusDocument.PSObject.Properties[$name]
                 if ($null -ne $property) { $state[$name] = $property.Value }
             }
@@ -308,11 +312,39 @@ function Get-ObjectProperty {
     if ($null -eq $Object) {
         return $null
     }
+    if ($Object -is [System.Collections.IDictionary] -and $Object.Contains($Name)) {
+        return $Object[$Name]
+    }
     $property = $Object.PSObject.Properties[$Name]
     if ($null -eq $property) {
         return $null
     }
     return $property.Value
+}
+
+function Test-MonitorObjectProperty {
+    param(
+        [AllowNull()][object]$Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [System.Collections.IDictionary]) { return $Object.Contains($Name) }
+    return $null -ne $Object.PSObject.Properties[$Name]
+}
+
+function Get-MonitorFirstProperty {
+    param(
+        [AllowNull()][object]$Object,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+        if (Test-MonitorObjectProperty -Object $Object -Name $name) {
+            return [pscustomobject]@{ Present = $true; Name = $name; Value = (Get-ObjectProperty -Object $Object -Name $name) }
+        }
+    }
+    return [pscustomobject]@{ Present = $false; Name = $null; Value = $null }
 }
 
 function ConvertTo-MonitorUtcDateTimeValue {
@@ -339,6 +371,35 @@ function Get-MonitorProcessExecutablePath {
     try { return [string][HeadroomMonitorProcessPathProbe]::Read($ProcessId) } catch { return '' }
 }
 
+function Get-MonitorExactCodexProcessInventory {
+    $expectedByName = @{
+        'codex-plus-plus.exe' = $script:CodexPlusPlusExecutablePath
+        'codex-plus-plus-manager.exe' = $script:CodexPlusPlusManagerExecutablePath
+    }
+    $inventory = [System.Collections.Generic.List[object]]::new()
+    try { $snapshots = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) }
+    catch { return @() }
+    foreach ($snapshot in $snapshots) {
+        $name = [IO.Path]::GetFileName([string]$snapshot.ExecutablePath)
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$snapshot.Name }
+        if ([string]::IsNullOrWhiteSpace($name) -or -not $expectedByName.ContainsKey($name.ToLowerInvariant())) { continue }
+        $path = [string]$snapshot.ExecutablePath
+        if ([string]::IsNullOrWhiteSpace($path)) { $path = Get-MonitorProcessExecutablePath -ProcessId ([int]$snapshot.ProcessId) }
+        try {
+            $normalizedPath = [IO.Path]::GetFullPath($path)
+            $expectedPath = [IO.Path]::GetFullPath([string]$expectedByName[$name.ToLowerInvariant()])
+        }
+        catch { continue }
+        if ([string]::Equals($normalizedPath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+            [void]$inventory.Add([pscustomobject]@{
+                    ProcessId = [int]$snapshot.ProcessId
+                    ExecutablePath = $normalizedPath
+                })
+        }
+    }
+    return @($inventory)
+}
+
 function Test-CommandLineParameter {
     param(
         [AllowNull()][string]$CommandLine,
@@ -350,6 +411,42 @@ function Test-CommandLineParameter {
     $valuePattern = [regex]::Escape($ExpectedValue)
     $pattern = '(?i)(?:^|\s)' + $namePattern + '\s+(?:"' + $valuePattern + '"|''' + $valuePattern + '''|' + $valuePattern + ')(?=\s|$)'
     return $CommandLine -match $pattern
+}
+
+function Test-MonitorRouteKeeperIdentity {
+    param(
+        [AllowNull()][object]$RouteState,
+        [AllowNull()][object]$KeeperProcess,
+        [AllowNull()][object]$KeeperInfo,
+        [AllowNull()][string]$CommandLine
+    )
+    if ($null -eq $RouteState -or $null -eq $KeeperProcess) { return $false }
+    if ([string](Get-ObjectProperty -Object $RouteState -Name 'route_keeper_mode') -ne 'watch') { return $false }
+    $keeperPath = [string](Get-ObjectProperty -Object $RouteState -Name 'route_keeper_script_path')
+    if ([string]::IsNullOrWhiteSpace($keeperPath)) { return $false }
+    try {
+        if (-not [IO.Path]::GetFullPath($keeperPath).Equals([IO.Path]::GetFullPath($script:RouteKeeperPath), [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    catch { return $false }
+    $actualExecutablePath = Get-MonitorProcessExecutablePath -ProcessId ([int]$KeeperProcess.Id)
+    try { $actualExecutableName = [IO.Path]::GetFileName([IO.Path]::GetFullPath($actualExecutablePath)) } catch { return $false }
+    if ($actualExecutableName -notin @('pwsh.exe', 'powershell.exe')) { return $false }
+    try {
+        $expectedStarted = ConvertTo-MonitorUtcDateTimeValue -Value (Get-ObjectProperty -Object $RouteState -Name 'route_keeper_started_at')
+        if ($null -eq $expectedStarted -or [Math]::Abs(($KeeperProcess.StartTime.ToUniversalTime() - $expectedStarted).TotalSeconds) -gt 30) { return $false }
+    }
+    catch { return $false }
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        # Elevated PowerShell may hide CommandLine from a non-elevated monitor.
+        # The route-state path/mode, native executable path, PID and start time
+        # remain independently verifiable identity evidence in that case.
+        return $true
+    }
+    $normalizedCommandLine = $CommandLine.Replace('/', '\')
+    return (
+        $normalizedCommandLine.IndexOf(([IO.Path]::GetFullPath($script:RouteKeeperPath).Replace('/', '\')), [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+        $normalizedCommandLine -match '(?i)(^|\s)-Watch(\s|$)'
+    )
 }
 
 function ConvertTo-StatsNumber {
@@ -366,6 +463,62 @@ function ConvertTo-StatsNumber {
         return $null
     }
     return [Math]::Max([double]0, $number)
+}
+
+function Get-KompressBrokerCounterWindow {
+    param([AllowNull()][object]$Counters)
+
+    $aliases = [ordered]@{
+        queue_full = @('queue_full')
+        timeout = @('timeout')
+        device_removal = @('device_removal', 'device_loss', 'device_removed')
+    }
+    $current = [ordered]@{}
+    foreach ($name in $aliases.Keys) {
+        $value = $null
+        foreach ($alias in $aliases[$name]) {
+            $candidate = ConvertTo-StatsNumber (Get-ObjectProperty -Object $Counters -Name $alias)
+            if ($null -ne $candidate) {
+                $value = $candidate
+                break
+            }
+        }
+        $current[$name] = $value
+    }
+
+    $available = @($current.Values | Where-Object { $null -ne $_ }).Count -gt 0
+    $delta = [ordered]@{ queue_full = 0; timeout = 0; device_removal = 0 }
+    $baselinePending = $false
+    $resetDetected = $false
+    if ($available -and $null -eq $script:KompressBrokerCounterBaseline) {
+        $script:KompressBrokerCounterBaseline = [ordered]@{}
+        foreach ($name in $aliases.Keys) { $script:KompressBrokerCounterBaseline[$name] = $current[$name] }
+        $baselinePending = $true
+    }
+    elseif ($available) {
+        foreach ($name in $aliases.Keys) {
+            $now = $current[$name]
+            $before = Get-ObjectProperty -Object $script:KompressBrokerCounterBaseline -Name $name
+            if ($null -eq $now) { continue }
+            if ($null -eq $before -or $now -lt $before) {
+                $resetDetected = $resetDetected -or ($null -ne $before -and $now -lt $before)
+                $script:KompressBrokerCounterBaseline[$name] = $now
+                continue
+            }
+            $delta[$name] = [double]$now - [double]$before
+            $script:KompressBrokerCounterBaseline[$name] = $now
+        }
+    }
+    $anyIncreased = @($delta.Values | Where-Object { [double]$_ -gt 0 }).Count -gt 0
+    return [pscustomobject]@{
+        Available = $available
+        BaselinePending = $baselinePending
+        DeltaAvailable = $available -and -not $baselinePending
+        ResetDetected = $resetDetected
+        AnyIncreased = $anyIncreased
+        Current = [pscustomobject]$current
+        Delta = [pscustomobject]$delta
+    }
 }
 
 function ConvertTo-TokenStatsNumber {
@@ -614,14 +767,42 @@ function Get-StatsTrafficObservation {
     $inboundActive = ConvertTo-StatsNumber (Get-ObjectProperty $proxyInbound 'active')
     # `active` is a global inbound counter and may include /stats or other probes.
     # Without a model-scoped active metric it cannot prove a pending model request.
-    $hasPendingModelInbound = $false
+    $activeModelEvidenceCount = [double]0
+    $activeModelEvidenceSource = $null
+    $activeModelScalarNames = @('active_model', 'active_model_requests', 'active_requests_model', 'model_active')
+    foreach ($container in @($proxyInbound, $requests)) {
+        if ($null -eq $container) { continue }
+        foreach ($name in $activeModelScalarNames) {
+            $count = ConvertTo-StatsNumber (Get-ObjectProperty $container $name)
+            if ($null -ne $count -and $count -gt 0) {
+                $activeModelEvidenceCount = [Math]::Max($activeModelEvidenceCount, [double]$count)
+                if ([string]::IsNullOrWhiteSpace($activeModelEvidenceSource)) { $activeModelEvidenceSource = $name }
+            }
+        }
+    }
+    foreach ($mapName in @('active_by_model', 'active_models', 'active_by_path')) {
+        $map = Get-ObjectProperty $proxyInbound $mapName
+        if ($null -eq $map) { continue }
+        foreach ($property in @($map.PSObject.Properties)) {
+            $key = ([string]$property.Name).Split('?')[0]
+            $count = ConvertTo-StatsNumber $property.Value
+            if ($null -eq $count -or $count -le 0) { continue }
+            $isModelEntry = $mapName -in @('active_by_model', 'active_models') -or ($key -match '(?i)^/v1/' -and $key -notmatch '(?i)^/v1/models/?$')
+            if ($isModelEntry) {
+                $activeModelEvidenceCount += [double]$count
+                if ([string]::IsNullOrWhiteSpace($activeModelEvidenceSource)) { $activeModelEvidenceSource = $mapName }
+            }
+        }
+    }
+    $hasPendingModelInbound = $activeModelEvidenceCount -gt 0
 
     $available = $null -ne $Body
     $trafficKnown = ($null -ne $httpCompleted -and $hasInboundMetric) -or
                     ($null -ne $successfulNonProbe -and $successfulNonProbe -gt 0 -and $hasInboundMetric)
     $httpText = if ($null -eq $httpCompleted) { 'unknown' } else { [string]$httpCompleted }
     $wsText = if ($null -eq $wsActivity) { 'unknown' } else { [string]$wsActivity }
-    $observation = "HTTP=$httpText, WS=$wsText, inbound_model=$inboundModel"
+    $activeModelText = if ($hasPendingModelInbound) { [string]$activeModelEvidenceCount } else { '0' }
+    $observation = "HTTP=$httpText, WS=$wsText, inbound_model=$inboundModel, active_model=$activeModelText"
     $pathObservation = if ($pathDetails.Count -gt 0) { [string]::Join(',', @($pathDetails)) } else { 'none' }
     return [pscustomobject]@{
         Available = $available
@@ -643,9 +824,91 @@ function Get-StatsTrafficObservation {
         InboundActive = $inboundActive
         InboundPaths = @($pathDetails)
         HasPendingModelInbound = $hasPendingModelInbound
+        ActiveModelEvidenceCount = $activeModelEvidenceCount
+        ActiveModelEvidenceSource = $activeModelEvidenceSource
         TrafficKnown = $trafficKnown
         Observation = $observation
         PathObservation = $pathObservation
+    }
+}
+
+function Get-MonitorApiObservation {
+    param(
+        [AllowNull()][object]$Traffic,
+        [AllowNull()][object]$Delta,
+        [bool]$HasSuccessfulModelRequest,
+        [bool]$HasUnrecoveredModelFailure
+    )
+
+    $completedBaseline = ConvertTo-StatsNumber (Get-ObjectProperty $Traffic 'HttpCompleted')
+    $passthroughBaseline = ConvertTo-StatsNumber (Get-ObjectProperty $Traffic 'PassthroughModels')
+    $hasCompletedEvidence = $null -ne $completedBaseline -and $completedBaseline -gt 0 -and $null -ne $passthroughBaseline
+    $effectiveSuccess = $HasSuccessfulModelRequest -or $hasCompletedEvidence
+    $hasActiveModelEvidence = $null -ne $Traffic -and (Get-ObjectProperty $Traffic 'HasPendingModelInbound') -eq $true
+    $activeEvidenceSource = [string](Get-ObjectProperty $Traffic 'ActiveModelEvidenceSource')
+    $activeDetail = if ([string]::IsNullOrWhiteSpace($activeEvidenceSource)) {
+        '未发现模型范围 active 证据；全局 inbound active 不足以证明请求仍在进行'
+    }
+    else {
+        "检测到模型范围 active 证据（$activeEvidenceSource）"
+    }
+
+    if ($null -eq $Delta -and $hasActiveModelEvidence) {
+        return [pscustomobject]@{
+            State = 'yellow'
+            Summary = '等待完成'
+            Detail = "观察到模型请求仍处于活动状态；$activeDetail"
+            IssueCode = 'api.pending_completion'
+        }
+    }
+    if ($null -eq $Delta) {
+        return [pscustomobject]@{
+            State = 'yellow'
+            Summary = '等待基线'
+            Detail = '当前监控尚无可比的完成请求增量'
+            IssueCode = 'api.evidence_pending'
+        }
+    }
+
+    $failed = ConvertTo-StatsNumber (Get-ObjectProperty $Delta 'FailedTotal')
+    $completed = ConvertTo-StatsNumber (Get-ObjectProperty $Delta 'HttpCompleted')
+    if ($null -ne $failed -and $failed -gt 0) {
+        return [pscustomobject]@{
+            State = 'red'
+            Summary = '出现失败'
+            Detail = "当前监控窗口发现 $failed 个失败请求"
+            IssueCode = 'api.request_failed'
+        }
+    }
+    if ($null -ne $completed -and $completed -gt 0) {
+        return [pscustomobject]@{
+            State = 'green'
+            Summary = '有完成请求'
+            Detail = "当前窗口完成 $completed 个 HTTP 请求"
+            IssueCode = $null
+        }
+    }
+    if ($hasActiveModelEvidence) {
+        return [pscustomobject]@{
+            State = 'yellow'
+            Summary = '等待完成'
+            Detail = "观察到模型请求仍处于活动状态；$activeDetail"
+            IssueCode = 'api.pending_completion'
+        }
+    }
+    if ($effectiveSuccess -and -not $HasUnrecoveredModelFailure) {
+        return [pscustomobject]@{
+            State = 'green'
+            Summary = '当前周期空闲'
+            Detail = '已有成功模型请求证据且当前周期没有模型范围 active 证据'
+            IssueCode = $null
+        }
+    }
+    return [pscustomobject]@{
+        State = 'yellow'
+        Summary = '等待基线'
+        Detail = "当前无模型范围 active 证据；$activeDetail"
+        IssueCode = 'api.evidence_pending'
     }
 }
 
@@ -740,6 +1003,71 @@ function Get-LogWindowEvidence {
     }
 }
 
+function Get-TransportObservation {
+    param(
+        [Parameter(Mandatory)][object]$Logs
+    )
+
+    $helper5xx = [int](ConvertTo-StatsNumber (Get-ObjectProperty -Object $Logs -Name 'Helper5xxCount') ?? 0)
+    $proxy5xx = [int](ConvertTo-StatsNumber (Get-ObjectProperty -Object $Logs -Name 'Proxy5xxCount') ?? 0)
+    $wsFallback = [int](ConvertTo-StatsNumber (Get-ObjectProperty -Object $Logs -Name 'WsFallbackCount') ?? 0)
+    $framesFailed = [int](ConvertTo-StatsNumber (Get-ObjectProperty -Object $Logs -Name 'FramesFailedCount') ?? 0)
+    $wsClientErrors = [int](ConvertTo-StatsNumber (Get-ObjectProperty -Object $Logs -Name 'WsClientErrorCount') ?? 0)
+    $proxySuccess = [int](ConvertTo-StatsNumber (Get-ObjectProperty -Object $Logs -Name 'ProxySuccessCount') ?? 0)
+    $helperRecovered = [bool](Get-ObjectProperty -Object $Logs -Name 'Helper5xxRecovered')
+    $fallbackRecovered = [bool](Get-ObjectProperty -Object $Logs -Name 'WsFallbackRecovered')
+    $clientErrorRecovered = [bool](Get-ObjectProperty -Object $Logs -Name 'WsClientErrorRecovered')
+    $framesRecovered = $framesFailed -gt 0 -and $proxySuccess -gt 0
+    $hasHistoricalEvidence = $helper5xx -gt 0 -or $proxy5xx -gt 0 -or $wsFallback -gt 0 -or $framesFailed -gt 0 -or $wsClientErrors -gt 0
+    $hasUnrecoveredHelper = $helper5xx -gt 0 -and -not $helperRecovered
+    $hasUnrecoveredOther = ($proxy5xx -gt 0 -and $proxySuccess -le 0) -or ($wsFallback -gt 0 -and -not $fallbackRecovered) -or ($framesFailed -gt 0 -and -not $framesRecovered) -or ($wsClientErrors -gt 0 -and -not $clientErrorRecovered)
+
+    if ($hasUnrecoveredHelper) {
+        return [pscustomobject]@{
+            State = 'red'
+            Summary = 'helper 失败'
+            Detail = "当前窗口发现 $helper5xx 个 helper 5xx，且未观察到后续成功；proxy5xx=$proxy5xx, ws_fallback=$wsFallback, frames_failed_total=$framesFailed, ws:client_error=$wsClientErrors"
+            IssueCode = 'transport.helper_5xx'
+            Recovered = $false
+        }
+    }
+    if ($hasUnrecoveredOther) {
+        $issueCode = if ($wsClientErrors -gt 0 -and -not $clientErrorRecovered) { 'transport.ws_client_error' } elseif ($wsFallback -gt 0 -and -not $fallbackRecovered) { 'transport.ws_fallback' } elseif ($framesFailed -gt 0 -and -not $framesRecovered) { 'transport.frames_failed_total' } else { 'transport.proxy_5xx' }
+        return [pscustomobject]@{
+            State = 'yellow'
+            Summary = '传输异常'
+            Detail = "窗口证据尚未恢复：helper5xx=$helper5xx, proxy5xx=$proxy5xx, ws_fallback=$wsFallback, frames_failed_total=$framesFailed, ws:client_error=$wsClientErrors"
+            IssueCode = $issueCode
+            Recovered = $false
+        }
+    }
+    if ($hasHistoricalEvidence) {
+        return [pscustomobject]@{
+            State = 'green'
+            Summary = '历史异常已恢复'
+            Detail = "本监控窗口曾记录 helper5xx=$helper5xx, proxy5xx=$proxy5xx, ws_fallback=$wsFallback, frames_failed_total=$framesFailed, ws:client_error=$wsClientErrors；已有后续成功证据，当前不判为活动故障"
+            IssueCode = $null
+            Recovered = $true
+        }
+    }
+    if (-not [bool](Get-ObjectProperty -Object $Logs -Name 'EvidenceAvailable')) {
+        return [pscustomobject]@{
+            State = 'yellow'
+            Summary = '证据不足'
+            Detail = '当前日志不可读或尚无带时间戳样本，不能把缺失当作正常'
+            IssueCode = 'transport.evidence_missing'
+            Recovered = $false
+        }
+    }
+    return [pscustomobject]@{
+        State = 'green'
+        Summary = '无当前窗口异常'
+        Detail = 'helper/proxy 当前监控窗口未发现 5xx、WS fallback 或 client_error'
+        IssueCode = $null
+        Recovered = $true
+    }
+}
+
 function ConvertTo-UnifiedState {
     param([AllowNull()][object]$State)
     switch ([string]$State) {
@@ -752,15 +1080,24 @@ function ConvertTo-UnifiedState {
 
 function Get-GatewayTokenAccounting {
     $result = [ordered]@{
+        schema_version = 1
+        generation = $null
         input_before = 0
         input_after = 0
         saved = 0
         savings_percent = 0
+        completed = 0
+        missing = 0
+        invalid = 0
         completed_samples = 0
         missing_samples = 0
         invalid_samples = 0
+        legacy_missing = 0
+        excluded_bypass = 0
+        excluded_error = 0
         has_sample = $false
         exact = $false
+        source = 'none'
     }
     if (-not (Test-Path -LiteralPath $script:GatewayStatePath -PathType Leaf)) { return $result }
     try {
@@ -772,34 +1109,136 @@ function Get-GatewayTokenAccounting {
         return $result
     }
     $aggregate = Get-ObjectProperty -Object $state -Name 'token_accounting'
-    if ($null -ne $aggregate -and $null -ne (Get-ObjectProperty -Object $aggregate -Name 'completed_samples')) {
-        $aggregateHasBefore = $null -ne $aggregate.PSObject.Properties['input_before'] -and $null -ne (Get-ObjectProperty -Object $aggregate -Name 'input_before')
-        $aggregateHasAfter = $null -ne $aggregate.PSObject.Properties['input_after'] -and $null -ne (Get-ObjectProperty -Object $aggregate -Name 'input_after')
-        $aggregateHasSaved = $null -ne $aggregate.PSObject.Properties['saved'] -and $null -ne (Get-ObjectProperty -Object $aggregate -Name 'saved')
-        $aggregateValuesValid = $true
-        foreach ($name in @('input_before', 'input_after', 'saved', 'completed_samples', 'missing_samples', 'invalid_samples')) {
-            $rawValue = Get-ObjectProperty -Object $aggregate -Name $name
-            $value = ConvertTo-TokenStatsNumber $rawValue
-            if ($null -ne $rawValue -and $null -eq $value) {
-                $aggregateValuesValid = $false
+    if ($null -ne $aggregate) {
+        $schemaField = Get-MonitorFirstProperty -Object $aggregate -Names @('schema_version', 'schemaVersion')
+        $schemaVersion = if ($schemaField.Present) { ConvertTo-TokenStatsNumber $schemaField.Value } else { $null }
+        if ($schemaField.Present -and $null -eq $schemaVersion) {
+            $result.schema_version = 2
+            $result.invalid_samples = 1
+            $result.invalid = 1
+            $result.source = 'gateway_v2_invalid'
+            return $result
+        }
+
+        $currentField = Get-MonitorFirstProperty -Object $aggregate -Names @('current', 'current_generation', 'currentGeneration')
+        $isV2 = $schemaVersion -eq 2 -or $currentField.Present -or (Get-MonitorFirstProperty -Object $aggregate -Names @('legacy_missing', 'excluded_bypass', 'excluded_error', 'legacy', 'excluded')).Present
+        if ($isV2) {
+            $result.schema_version = 2
+            $result.source = 'gateway_v2'
+            $current = $aggregate
+            $currentValueIsObject = $currentField.Present -and $null -ne $currentField.Value -and (
+                $currentField.Value -is [System.Collections.IDictionary] -or
+                ($currentField.Value -isnot [ValueType] -and $currentField.Value -isnot [string] -and @($currentField.Value.PSObject.Properties).Count -gt 0)
+            )
+            if ($currentValueIsObject) {
+                $current = $currentField.Value
             }
-            if ($null -ne $value) { $result[$name] = $value }
+            $generationField = Get-MonitorFirstProperty -Object $current -Names @('generation', 'generation_id', 'generationId', 'id')
+            if (-not $generationField.Present -and $current -ne $aggregate) {
+                $generationField = Get-MonitorFirstProperty -Object $aggregate -Names @('generation', 'generation_id', 'generationId')
+            }
+            if ($generationField.Present) { $result.generation = $generationField.Value }
+
+            $counterAliases = [ordered]@{
+                completed = @('completed', 'completed_samples', 'complete')
+                missing = @('missing', 'missing_samples')
+                invalid = @('invalid', 'invalid_samples')
+                input_before = @('input_before', 'before')
+                input_after = @('input_after', 'after')
+                saved = @('saved', 'tokens_saved')
+            }
+            $present = [ordered]@{}
+            $invalidField = $false
+            foreach ($name in $counterAliases.Keys) {
+                $field = Get-MonitorFirstProperty -Object $current -Names $counterAliases[$name]
+                $present[$name] = $field.Present
+                if (-not $field.Present) { continue }
+                $value = ConvertTo-TokenStatsNumber $field.Value
+                if ($null -eq $value) {
+                    $invalidField = $true
+                    continue
+                }
+                $result[$name] = $value
+            }
+            $legacyContainer = Get-MonitorFirstProperty -Object $aggregate -Names @('legacy', 'legacy_accounting')
+            $excludedContainer = Get-MonitorFirstProperty -Object $aggregate -Names @('excluded', 'excluded_accounting')
+            $detailFields = [ordered]@{
+                legacy_missing = @('legacy_missing', 'legacyMissing', 'legacy_missing_samples')
+                excluded_bypass = @('excluded_bypass', 'excludedBypass')
+                excluded_error = @('excluded_error', 'excludedError')
+            }
+            foreach ($name in $detailFields.Keys) {
+                $field = Get-MonitorFirstProperty -Object $aggregate -Names $detailFields[$name]
+                if (-not $field.Present -and $name -eq 'legacy_missing' -and $legacyContainer.Present) {
+                    $field = Get-MonitorFirstProperty -Object $legacyContainer.Value -Names @('missing', 'missing_samples', 'legacy_missing')
+                }
+                elseif (-not $field.Present -and $name -eq 'excluded_bypass' -and $excludedContainer.Present) {
+                    $field = Get-MonitorFirstProperty -Object $excludedContainer.Value -Names @('bypass', 'excluded_bypass')
+                }
+                elseif (-not $field.Present -and $name -eq 'excluded_error' -and $excludedContainer.Present) {
+                    $field = Get-MonitorFirstProperty -Object $excludedContainer.Value -Names @('error', 'excluded_error')
+                }
+                if (-not $field.Present) { continue }
+                $value = ConvertTo-TokenStatsNumber $field.Value
+                if ($null -eq $value) { $invalidField = $true } else { $result[$name] = $value }
+            }
+            $result.completed_samples = [double]$result.completed
+            $result.missing_samples = [double]$result.missing
+            $result.invalid_samples = [double]$result.invalid
+            $result.completed = $result.completed_samples
+            $result.missing = $result.missing_samples
+            $result.invalid = $result.invalid_samples
+            $allTotalsPresent = $present.input_before -and $present.input_after -and $present.saved
+            if (-not ($present.completed -and $present.missing -and $present.invalid -and $allTotalsPresent)) {
+                $result.missing_samples = [Math]::Max(1, [int]$result.missing_samples)
+                $result.missing = $result.missing_samples
+            }
+            if ($allTotalsPresent -and (
+                    $result.input_after -gt $result.input_before -or
+                    $result.saved -ne ($result.input_before - $result.input_after)
+                )) {
+                $invalidField = $true
+            }
+            if ($invalidField) {
+                $result.invalid_samples = [Math]::Max(1, [int]$result.invalid_samples)
+                $result.invalid = $result.invalid_samples
+            }
+            $result.has_sample = $result.completed_samples -gt 0 -or $result.missing_samples -gt 0 -or $result.invalid_samples -gt 0
+            $result.exact = $result.completed_samples -gt 0 -and $result.missing_samples -eq 0 -and $result.invalid_samples -eq 0 -and $allTotalsPresent -and -not $invalidField
+            if ($result.input_before -gt 0) {
+                $result.savings_percent = [Math]::Round((100.0 * $result.saved / $result.input_before), 2)
+            }
+            return $result
         }
-        if ($result.completed_samples -gt 0 -and -not ($aggregateHasBefore -and $aggregateHasAfter -and $aggregateHasSaved)) {
-            $result.missing_samples = [Math]::Max(1, [int]$result.missing_samples)
+
+        if ((Get-MonitorFirstProperty -Object $aggregate -Names @('completed_samples')).Present) {
+            $result.source = 'gateway_v1_aggregate'
+            foreach ($name in @('input_before', 'input_after', 'saved', 'completed_samples', 'missing_samples', 'invalid_samples')) {
+                $rawValue = Get-ObjectProperty -Object $aggregate -Name $name
+                $value = ConvertTo-TokenStatsNumber $rawValue
+                if ($null -ne $rawValue -and $null -eq $value) { $result.invalid_samples = [Math]::Max(1, [int]$result.invalid_samples) }
+                elseif ($null -ne $value) { $result[$name] = $value }
+            }
+            $aggregateHasBefore = (Get-MonitorFirstProperty -Object $aggregate -Names @('input_before')).Present
+            $aggregateHasAfter = (Get-MonitorFirstProperty -Object $aggregate -Names @('input_after')).Present
+            $aggregateHasSaved = (Get-MonitorFirstProperty -Object $aggregate -Names @('saved')).Present
+            if ($result.completed_samples -gt 0 -and -not ($aggregateHasBefore -and $aggregateHasAfter -and $aggregateHasSaved)) {
+                $result.missing_samples = [Math]::Max(1, [int]$result.missing_samples)
+            }
+            if ($aggregateHasBefore -and $aggregateHasAfter -and $aggregateHasSaved -and (
+                    $result.input_after -gt $result.input_before -or $result.saved -ne ($result.input_before - $result.input_after)
+                )) {
+                $result.invalid_samples = [Math]::Max(1, [int]$result.invalid_samples)
+            }
+            $result.completed = $result.completed_samples
+            $result.missing = $result.missing_samples
+            $result.invalid = $result.invalid_samples
+            $result.legacy_missing = $result.missing_samples
+            if ($result.input_before -gt 0) { $result.savings_percent = [Math]::Round((100.0 * $result.saved / $result.input_before), 2) }
+            $result.has_sample = $result.completed_samples -gt 0 -or $result.invalid_samples -gt 0 -or $result.missing_samples -gt 0
+            $result.exact = $result.completed_samples -gt 0 -and $result.invalid_samples -eq 0 -and $result.missing_samples -eq 0
+            return $result
         }
-        if (-not $aggregateValuesValid -or (
-                $aggregateHasBefore -and $aggregateHasAfter -and $aggregateHasSaved -and
-                ($result.input_after -gt $result.input_before -or $result.saved -ne ($result.input_before - $result.input_after))
-            )) {
-            $result.invalid_samples = [Math]::Max(1, [int]$result.invalid_samples)
-        }
-        if ($result.input_before -gt 0) {
-            $result.savings_percent = [Math]::Round((100.0 * $result.saved / $result.input_before), 2)
-        }
-        $result.has_sample = $result.completed_samples -gt 0 -or $result.invalid_samples -gt 0
-        $result.exact = $result.completed_samples -gt 0 -and $result.invalid_samples -eq 0 -and $result.missing_samples -eq 0
-        return $result
     }
     foreach ($entry in $recent) {
         $token = Get-ObjectProperty -Object $entry -Name 'token'
@@ -828,6 +1267,11 @@ function Get-GatewayTokenAccounting {
     if ($result.input_before -gt 0) {
         $result.savings_percent = [Math]::Round((100.0 * $result.saved / $result.input_before), 2)
     }
+    $result.source = 'gateway_v1_recent'
+    $result.completed = $result.completed_samples
+    $result.missing = $result.missing_samples
+    $result.invalid = $result.invalid_samples
+    $result.legacy_missing = $result.missing_samples
     $result.exact = $result.completed_samples -gt 0 -and $result.invalid_samples -eq 0 -and $result.missing_samples -eq 0
     return $result
 }
@@ -905,8 +1349,8 @@ function New-UnifiedItem {
 function Get-UnifiedStatusFingerprint {
     param(
         [Parameter(Mandatory)][string]$Overall,
-        [Parameter(Mandatory)][object[]]$Items,
-        [Parameter(Mandatory)][object[]]$ActiveIssues
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ActiveIssues
     )
 
     $itemParts = @($Items | ForEach-Object {
@@ -1003,6 +1447,21 @@ function Get-UnifiedStatus {
     }
     & $addItem (New-UnifiedItem 'route' '客户端路由' $routeState $routeSummary $routeDetail $observedAt 'monitor route/config/process' $routeIssue $routeBypassDetail)
 
+    $officialDataplane = Get-ObjectProperty -Object $Snapshot -Name 'OfficialDataplane'
+    if ($null -eq $officialDataplane) { $officialDataplane = New-EmptyOfficialDataplaneDocument -ObservedAt $observedAt }
+    $officialClass = [string](Get-ObjectProperty -Object $officialDataplane -Name 'classification')
+    $officialBasis = @((Get-ObjectProperty -Object $officialDataplane -Name 'basis')) | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $officialBasisText = if ($officialBasis.Count -gt 0) { [string]::Join(', ', $officialBasis) } else { 'no_basis' }
+    $officialState = 'yellow'; $officialSummary = '官方数据面未知'; $officialIssue = 'official_dataplane.unknown'
+    if ($officialClass -eq 'confirmed') {
+        $officialState = 'green'; $officialSummary = '官方数据面已确认'; $officialIssue = $null
+    }
+    elseif ($officialClass -eq 'bypass') {
+        $officialState = 'red'; $officialSummary = '官方数据面旁路'; $officialIssue = 'official_dataplane.bypass'
+    }
+    $officialDetail = "classification=$officialClass; pids=$([string]::Join(',', @((Get-ObjectProperty -Object $officialDataplane -Name 'official_pids')))); gateway_socket=$((Get-ObjectProperty -Object $officialDataplane -Name 'gateway_socket_observed')); vortex_socket=$((Get-ObjectProperty -Object $officialDataplane -Name 'vortex_socket_observed')); basis=$officialBasisText"
+    & $addItem (New-UnifiedItem 'official-dataplane' '官方数据面' $officialState $officialSummary $officialDetail $observedAt 'official PID TCP + Gateway recent + upstream target' $officialIssue)
+
     $processes = $Snapshot.Processes
     $ownerCount = if ($null -ne $processes) { [int]$processes.OwnerCount } else { 0 }
     $activeCodexCount = if ($null -ne $processes) { @($processes.ActiveCodex).Count } else { 0 }
@@ -1019,43 +1478,32 @@ function Get-UnifiedStatus {
 
     $traffic = $Snapshot.Traffic
     $delta = $Snapshot.TrafficDelta
+    $trafficCompleted = ConvertTo-StatsNumber (Get-ObjectProperty $traffic 'HttpCompleted')
+    $trafficPassthrough = ConvertTo-StatsNumber (Get-ObjectProperty $traffic 'PassthroughModels')
+    if ($null -ne $trafficCompleted -and $trafficCompleted -gt 0 -and $null -ne $trafficPassthrough) {
+        # A completed counter observed after a monitor restart is still valid
+        # completion evidence.  Do not require this monitor instance to have
+        # observed the increment itself before allowing an idle baseline.
+        $script:HasSuccessfulModelRequest = $true
+    }
     if ($null -ne $delta) {
-        if ($delta.FailedTotal -gt 0) { $script:HasUnrecoveredModelFailure = $true }
-        if ($delta.HttpCompleted -gt 0) {
+        $deltaFailed = ConvertTo-StatsNumber (Get-ObjectProperty $delta 'FailedTotal')
+        $deltaCompleted = ConvertTo-StatsNumber (Get-ObjectProperty $delta 'HttpCompleted')
+        if ($null -ne $deltaFailed -and $deltaFailed -gt 0) { $script:HasUnrecoveredModelFailure = $true }
+        if ($null -ne $deltaCompleted -and $deltaCompleted -gt 0) {
             $script:HasSuccessfulModelRequest = $true
-            if ($delta.FailedTotal -le 0) { $script:HasUnrecoveredModelFailure = $false }
+            if ($null -eq $deltaFailed -or $deltaFailed -le 0) { $script:HasUnrecoveredModelFailure = $false }
         }
     }
-    if ($null -eq $delta) {
-        & $addItem (New-UnifiedItem 'api' 'HTTP API' 'yellow' '等待基线' '当前监控尚无可比的完成请求增量' $observedAt 'headroom /stats + monitor baseline' 'api.evidence_pending')
-    }
-    elseif ($delta.FailedTotal -gt 0) {
-        & $addItem (New-UnifiedItem 'api' 'HTTP API' 'red' '出现失败' ("当前监控窗口发现 {0} 个失败请求" -f $delta.FailedTotal) $observedAt 'headroom /stats' 'api.request_failed')
-    }
-    elseif ($delta.HttpCompleted -gt 0) {
-        & $addItem (New-UnifiedItem 'api' 'HTTP API' 'green' '有完成请求' ("当前窗口完成 {0} 个 HTTP 请求" -f $delta.HttpCompleted) $observedAt 'headroom /stats')
-    }
-    elseif ($script:HasSuccessfulModelRequest -and -not $script:HasUnrecoveredModelFailure -and $delta.InboundModel -le 0) {
-        & $addItem (New-UnifiedItem 'api' 'HTTP API' 'green' '当前周期空闲' '已有成功模型请求且当前周期没有进行中的模型请求' $observedAt 'headroom /stats')
-    }
-    else {
-        & $addItem (New-UnifiedItem 'api' 'HTTP API' 'yellow' '等待完成' '观察到模型请求进入但尚未完成，保留进行中警告' $observedAt 'headroom /stats' 'api.pending_completion')
-    }
+    $apiObservation = Get-MonitorApiObservation -Traffic $traffic -Delta $delta -HasSuccessfulModelRequest $script:HasSuccessfulModelRequest -HasUnrecoveredModelFailure $script:HasUnrecoveredModelFailure
+    & $addItem (New-UnifiedItem 'api' 'HTTP API' $apiObservation.State $apiObservation.Summary $apiObservation.Detail $observedAt 'headroom /stats' $apiObservation.IssueCode)
 
     $logs = $Snapshot.LogEvidence
-    $transportState = 'green'
-    $transportSummary = '无当前窗口异常'
-    $transportDetail = 'helper/proxy 当前监控窗口未发现 5xx、WS fallback 或 client_error'
-    $transportIssue = $null
-    if ($logs.Helper5xxCount -gt 0 -and -not $logs.Helper5xxRecovered) {
-        $transportState = 'red'; $transportSummary = 'helper 失败'; $transportDetail = "当前窗口发现 $($logs.Helper5xxCount) 个 helper 5xx，且未观察到后续成功"; $transportIssue = 'transport.helper_5xx'
-    }
-    elseif ($logs.Helper5xxCount -gt 0 -or $logs.WsClientErrorCount -gt 0 -or $logs.WsFallbackCount -gt 0 -or $logs.FramesFailedCount -gt 0) {
-        $transportState = 'yellow'; $transportSummary = '出现过异常'; $transportDetail = "窗口证据：helper5xx=$($logs.Helper5xxCount), ws_fallback=$($logs.WsFallbackCount), frames_failed_total=$($logs.FramesFailedCount), ws:client_error=$($logs.WsClientErrorCount)；恢复/最终结果需以上游证据确认"; $transportIssue = if ($logs.Helper5xxCount -gt 0) { 'transport.helper_5xx' } elseif ($logs.WsClientErrorCount -gt 0) { 'transport.ws_client_error' } elseif ($logs.WsFallbackCount -gt 0) { 'transport.ws_fallback' } else { 'transport.frames_failed_total' }
-    }
-    elseif (-not $logs.EvidenceAvailable) {
-        $transportState = 'yellow'; $transportSummary = '证据不足'; $transportDetail = '当前日志不可读或尚无带时间戳样本，不能把缺失当作正常'; $transportIssue = 'transport.evidence_missing'
-    }
+    $transportObservation = Get-TransportObservation -Logs $logs
+    $transportState = [string]$transportObservation.State
+    $transportSummary = [string]$transportObservation.Summary
+    $transportDetail = [string]$transportObservation.Detail
+    $transportIssue = $transportObservation.IssueCode
     & $addItem (New-UnifiedItem 'transport' '传输与错误' $transportState $transportSummary $transportDetail $observedAt 'proxy.log + codex-plus.log' $transportIssue)
 
     $kompress = Get-ObjectProperty (Get-ObjectProperty $healthBody 'checks') 'kompress'
@@ -1072,6 +1520,10 @@ function Get-UnifiedStatus {
     $brokerQueueFullTotal = (ConvertTo-StatsNumber (Get-ObjectProperty $brokerCounters 'queue_full')) ?? 0
     $brokerRestartTotal = (ConvertTo-StatsNumber (Get-ObjectProperty $brokerCounters 'worker_restart')) ?? 0
     $brokerDeviceRemovalTotal = (ConvertTo-StatsNumber (Get-ObjectProperty $brokerCounters 'device_removal')) ?? 0
+    $brokerCounterWindow = Get-KompressBrokerCounterWindow -Counters $brokerCounters
+    $brokerQueueFullDelta = ConvertTo-StatsNumber (Get-ObjectProperty $brokerCounterWindow.Delta 'queue_full') ?? 0
+    $brokerTimeoutDelta = ConvertTo-StatsNumber (Get-ObjectProperty $brokerCounterWindow.Delta 'timeout') ?? 0
+    $brokerDeviceRemovalDelta = ConvertTo-StatsNumber (Get-ObjectProperty $brokerCounterWindow.Delta 'device_removal') ?? 0
     $sourceStatus = [string](Get-ObjectProperty (Get-ObjectProperty $kompress 'info') 'source_status')
     if ([string]::IsNullOrWhiteSpace($sourceStatus)) { $sourceStatus = [string](Get-ObjectProperty (Get-ObjectProperty $warmupKompress 'info') 'source_status') }
     if ([string]::IsNullOrWhiteSpace($sourceStatus) -and [string]$Snapshot.CompressionPolicy -eq 'disabled') { $sourceStatus = 'deferred' }
@@ -1081,7 +1533,7 @@ function Get-UnifiedStatus {
     $queueTimeoutsTotal = if ($null -ne $compressionExecutor) { ConvertTo-StatsNumber $compressionExecutor.QueueTimeoutsTotal } else { $null }
     $queueTimeoutsIncreased = $null -ne $compressionExecutor -and [bool]$compressionExecutor.QueueTimeoutsIncreased
     $currentCompressionFailure = -not $brokerReady -or $brokerCircuitOpen -or $quarantineActive -or ($null -ne $timedOutWorkers -and $timedOutWorkers -gt 0)
-    $compressionWindowWarning = $queueTimeoutsIncreased -or $logs.CompressionTimeoutCount -gt 0 -or $logs.CompressionQuarantineCount -gt 0 -or $brokerTimeoutTotal -gt 0 -or $brokerQueueFullTotal -gt 0 -or $brokerDeviceRemovalTotal -gt 0
+    $compressionWindowWarning = $queueTimeoutsIncreased -or $logs.CompressionTimeoutCount -gt 0 -or $logs.CompressionQuarantineCount -gt 0 -or $brokerCounterWindow.AnyIncreased
     $kompressState = 'green'; $kompressSummary = '就绪'; $kompressDetail = "broker provider=$brokerProvider, backend=$brokerBackend, queue_limit=$brokerQueueLimit, fallback=$brokerFallbackTotal, worker_restart=$brokerRestartTotal"; $kompressIssue = $null
     if ([string]$Snapshot.CompressionPolicy -eq 'disabled' -and -not $currentCompressionFailure) {
         $kompressState = 'gray'; $kompressSummary = '按策略禁用'; $kompressDetail = 'Headroom 当前以 --no-optimize 运行；Kompress 不参与请求路径，其他代理转发仍可用'; $kompressIssue = $null
@@ -1090,7 +1542,7 @@ function Get-UnifiedStatus {
         $kompressState = 'red'; $kompressSummary = '运行时隔离或超时'; $kompressDetail = "broker_ready=$brokerReady, circuit_open=$brokerCircuitOpen, provider=$brokerProvider, backend=$brokerBackend, quarantine_active=$quarantineActive, timed_out_workers=$timedOutWorkers, worker_restart=$brokerRestartTotal, device_removal=$brokerDeviceRemovalTotal"; $kompressIssue = 'kompress.runtime_failure'
     }
     elseif ($compressionWindowWarning) {
-        $kompressState = 'yellow'; $kompressSummary = '发生过降级'; $kompressDetail = "queue_timeouts_total=$queueTimeoutsTotal, broker_timeout=$brokerTimeoutTotal, queue_full=$brokerQueueFullTotal, fallback=$brokerFallbackTotal, worker_restart=$brokerRestartTotal, device_removal=$brokerDeviceRemovalTotal"; $kompressIssue = 'kompress.deferred_or_timeout'
+        $kompressState = 'yellow'; $kompressSummary = '发生过降级'; $kompressDetail = "queue_timeouts_total=$queueTimeoutsTotal, broker_timeout_total=$brokerTimeoutTotal, broker_timeout_delta=$brokerTimeoutDelta, queue_full_total=$brokerQueueFullTotal, queue_full_delta=$brokerQueueFullDelta, fallback=$brokerFallbackTotal, worker_restart=$brokerRestartTotal, device_removal_total=$brokerDeviceRemovalTotal, device_removal_delta=$brokerDeviceRemovalDelta"; $kompressIssue = 'kompress.deferred_or_timeout'
     }
     elseif ($sourceStatus -eq 'deferred') {
         $kompressState = 'red'; $kompressSummary = '状态错误'; $kompressDetail = 'Headroom 仍报告 deferred；严格启动链不接受该状态。'; $kompressIssue = 'kompress.runtime_failure'
@@ -1106,17 +1558,16 @@ function Get-UnifiedStatus {
 
     $token = Get-GatewayTokenAccounting
     $tokenState = 'yellow'; $tokenSummary = '等待精确计量'; $tokenIssue = 'token-accounting.incomplete'
+    $tokenGeneration = if ($null -eq $token.generation) { 'unknown' } else { [string]$token.generation }
+    $tokenAncillary = "generation=$tokenGeneration, legacy_missing=$($token.legacy_missing), excluded_bypass=$($token.excluded_bypass), excluded_error=$($token.excluded_error)"
     if ($token.invalid_samples -gt 0) {
-        $tokenState = 'red'; $tokenSummary = '计量数据矛盾'; $tokenDetail = '发现负数、前后关系不合法或节省数不一致的精确计量样本'; $tokenIssue = 'token-accounting.invalid'
-    }
-    elseif ($token.exact -and $token.saved -gt 0) {
-        $tokenState = 'green'; $tokenSummary = '精确计量有效'; $tokenDetail = "压缩前 Token=$($token.input_before)，压缩后 Token=$($token.input_after)，实际节省 Token=$($token.saved)，实际节省百分比=$($token.savings_percent)%"; $tokenIssue = $null
+        $tokenState = 'red'; $tokenSummary = '计量数据矛盾'; $tokenDetail = "发现负数、前后关系不合法或节省数不一致的当前代际精确计量样本；$tokenAncillary"; $tokenIssue = 'token-accounting.invalid'
     }
     elseif ($token.exact) {
-        $tokenSummary = '暂无实际节省'; $tokenDetail = "压缩前 Token=$($token.input_before)，压缩后 Token=$($token.input_after)，实际节省 Token=$($token.saved)，实际节省百分比=$($token.savings_percent)%"
+        $tokenState = 'green'; $tokenSummary = if ($token.saved -gt 0) { '精确计量有效' } else { '精确计量有效；暂无节省' }; $tokenDetail = "压缩前 Token=$($token.input_before)，压缩后 Token=$($token.input_after)，实际节省 Token=$($token.saved)，实际节省百分比=$($token.savings_percent)%; $tokenAncillary"; $tokenIssue = $null
     }
     else {
-        $tokenDetail = "压缩前 Token=$($token.input_before)，压缩后 Token=$($token.input_after)，实际节省 Token=$($token.saved)，实际节省百分比=$($token.savings_percent)%; 完成精确计量的请求数=$($token.completed_samples)，缺少精确计量的请求数=$($token.missing_samples)"
+        $tokenDetail = "压缩前 Token=$($token.input_before)，压缩后 Token=$($token.input_after)，实际节省 Token=$($token.saved)，实际节省百分比=$($token.savings_percent)%; 当前代际完成=$($token.completed_samples)，当前代际缺少=$($token.missing_samples)，当前代际无效=$($token.invalid_samples)；$tokenAncillary"
     }
     & $addItem (New-UnifiedItem 'token-accounting' 'Token accounting' $tokenState $tokenSummary $tokenDetail $observedAt 'gateway exact token headers' $tokenIssue)
 
@@ -1146,9 +1597,10 @@ function Get-UnifiedStatus {
         traffic_delta = ConvertTo-MonitorTrafficDeltaDocument -TrafficDelta $Snapshot.TrafficDelta
         log_evidence = [ordered]@{ helper_5xx = $logs.Helper5xxCount; proxy_5xx = $logs.Proxy5xxCount; ws_fallback = $logs.WsFallbackCount; frames_failed_total = $logs.FramesFailedCount; ws_client_error = $logs.WsClientErrorCount; compression_timeout = $logs.CompressionTimeoutCount; compression_quarantine = $logs.CompressionQuarantineCount }
         compression_executor = [ordered]@{ quarantine_active = $quarantineActive; timed_out_workers = $timedOutWorkers; queue_timeouts_total = $queueTimeoutsTotal; queue_timeouts_increased = $queueTimeoutsIncreased }
-        kompress_broker = [ordered]@{ ready = $brokerReady; provider = $brokerProvider; backend = $brokerBackend; circuit_open = $brokerCircuitOpen; queue_limit = $brokerQueueLimit; fallback_total = $brokerFallbackTotal; timeout_total = $brokerTimeoutTotal; queue_full_total = $brokerQueueFullTotal; worker_restart_total = $brokerRestartTotal; device_removal_total = $brokerDeviceRemovalTotal }
-        token_accounting = [ordered]@{ input_before = $token.input_before; input_after = $token.input_after; saved = $token.saved; savings_percent = $token.savings_percent; completed_samples = $token.completed_samples; missing_samples = $token.missing_samples; invalid_samples = $token.invalid_samples; exact = $token.exact }
+        kompress_broker = [ordered]@{ ready = $brokerReady; provider = $brokerProvider; backend = $brokerBackend; circuit_open = $brokerCircuitOpen; queue_limit = $brokerQueueLimit; fallback_total = $brokerFallbackTotal; timeout_total = $brokerTimeoutTotal; timeout_delta = $brokerTimeoutDelta; queue_full_total = $brokerQueueFullTotal; queue_full_delta = $brokerQueueFullDelta; worker_restart_total = $brokerRestartTotal; device_removal_total = $brokerDeviceRemovalTotal; device_removal_delta = $brokerDeviceRemovalDelta; counter_baseline_pending = $brokerCounterWindow.BaselinePending; counter_reset_detected = $brokerCounterWindow.ResetDetected }
+        token_accounting = [ordered]@{ schema_version = $token.schema_version; generation = $token.generation; input_before = $token.input_before; input_after = $token.input_after; saved = $token.saved; savings_percent = $token.savings_percent; completed = $token.completed; missing = $token.missing; invalid = $token.invalid; completed_samples = $token.completed_samples; missing_samples = $token.missing_samples; invalid_samples = $token.invalid_samples; legacy_missing = $token.legacy_missing; excluded_bypass = $token.excluded_bypass; excluded_error = $token.excluded_error; exact = $token.exact; source = $token.source }
         cache_effectiveness = $cacheEffectiveness
+        official_dataplane = $officialDataplane
         status_fingerprint = $statusFingerprint
         process = [ordered]@{ owner_count = $ownerCount; active_codex_count = $activeCodexCount; standard_codex_count = $standardCount }
     }
@@ -1168,6 +1620,7 @@ function Get-UnifiedStatus {
         overall = $overall
         items = @($items)
         metrics = $metrics
+        official_dataplane = $officialDataplane
         active_issues = $activeIssues
         recent_recoveries = @($script:RecentRecoveries)
     }
@@ -1184,6 +1637,7 @@ function Get-UnifiedStatusFallback {
         @{ Key = 'headroom-health'; Label = 'Headroom health' },
         @{ Key = 'relay'; Label = 'Relay 57321' },
         @{ Key = 'route'; Label = '客户端路由' },
+        @{ Key = 'official-dataplane'; Label = '官方数据面' },
         @{ Key = 'codex-connection'; Label = 'Codex 连接' },
         @{ Key = 'api'; Label = 'HTTP API' },
         @{ Key = 'transport'; Label = '传输与错误' },
@@ -1201,7 +1655,8 @@ function Get-UnifiedStatusFallback {
                 }
             })
         $activeIssues = @([ordered]@{ code = 'monitor-core.prelaunch_grace'; item_key = 'monitor-core'; state = 'green'; summary = '启动宽限期'; detail = '等待有效 Codex++ owner'; observed_at = $now })
-        $metrics = [ordered]@{ prelaunch_grace_active = $true; prelaunch_grace_seconds = $PrelaunchGraceSeconds; cache_effectiveness = New-EmptyCacheEffectivenessDocument }
+        $emptyOfficial = New-EmptyOfficialDataplaneDocument -ObservedAt $now
+        $metrics = [ordered]@{ prelaunch_grace_active = $true; prelaunch_grace_seconds = $PrelaunchGraceSeconds; cache_effectiveness = New-EmptyCacheEffectivenessDocument; official_dataplane = $emptyOfficial }
         $metrics.status_fingerprint = Get-UnifiedStatusFingerprint -Overall 'yellow' -Items @($items) -ActiveIssues @($activeIssues)
         return [pscustomobject][ordered]@{
             schema_version = 2
@@ -1219,13 +1674,15 @@ function Get-UnifiedStatusFallback {
             overall = 'yellow'
             items = $items
             metrics = $metrics
+            official_dataplane = $emptyOfficial
             active_issues = $activeIssues
             recent_recoveries = @()
         }
     }
     $items = @($keys | ForEach-Object { New-UnifiedItem $_.Key $_.Label 'red' '统一监控尚未就绪' '等待 monitor 完成首轮采集；此响应仅用于明确不可用状态' $now 'monitor /status' 'monitor-core.unavailable' })
     $activeIssues = @([ordered]@{ code = 'monitor-core.unavailable'; item_key = 'monitor-core'; state = 'red'; summary = '统一监控尚未就绪'; detail = 'monitor 尚未完成首轮采集'; observed_at = $now })
-    $metrics = [ordered]@{ cache_effectiveness = New-EmptyCacheEffectivenessDocument }
+    $emptyOfficial = New-EmptyOfficialDataplaneDocument -ObservedAt $now
+    $metrics = [ordered]@{ cache_effectiveness = New-EmptyCacheEffectivenessDocument; official_dataplane = $emptyOfficial }
     $metrics.status_fingerprint = Get-UnifiedStatusFingerprint -Overall 'red' -Items @($items) -ActiveIssues @($activeIssues)
     return [pscustomobject][ordered]@{
         schema_version = 2
@@ -1243,6 +1700,7 @@ function Get-UnifiedStatusFallback {
         overall = 'red'
         items = $items
         metrics = $metrics
+        official_dataplane = $emptyOfficial
         active_issues = $activeIssues
         recent_recoveries = @()
     }
@@ -1728,12 +2186,302 @@ function Get-ProcessSnapshot {
         ParentProcessIds = $parentProcessIds
         ProcessPaths = $processPaths
         StandardCodex = $standardCodex
+        OfficialDesktop = @(Get-OfficialDesktopProcessInventory)
         CommandLineReadableCount = $commandLineReadableCount
         CommandLineErrorCount = $commandLineErrorCount
         ParentProcessReadableCount = $parentProcessReadableCount
         ParentProcessErrorCount = $parentProcessErrorCount
         Errors = @($result.Errors)
         OwnerCount = @($result.CodexPlusPlus).Count + @($result.Manager).Count
+    }
+}
+
+function Get-OfficialDesktopProcessInventory {
+    $inventory = [System.Collections.Generic.List[object]]::new()
+    $processes = @()
+    try { $processes = @(Get-Process -Name ChatGPT,codex -ErrorAction SilentlyContinue) } catch { return @() }
+    foreach ($process in $processes) {
+        $name = [string]$process.ProcessName
+        $path = [string]$process.Path
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            $path = Get-MonitorProcessExecutablePath -ProcessId ([int]$process.Id)
+        }
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = [IO.Path]::GetFileName($path) }
+        $isOfficial = $path -match '(?i)\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\(?:ChatGPT\.exe|resources\\codex\.exe)$'
+        if (-not $isOfficial) { continue }
+        $kind = if ($name -ieq 'ChatGPT.exe') { 'chatgpt' } else { 'codex' }
+        $metadata = Get-ProcessMetadataSafe -ProcessId ([int]$process.Id)
+        [void]$inventory.Add([pscustomobject]@{
+                ProcessId = [int]$process.Id
+                ParentProcessId = if ($null -ne $metadata) { [int]$metadata.ParentProcessId } else { $null }
+                Name = $name
+                Kind = $kind
+                ExecutablePath = $path
+            })
+    }
+    return @($inventory)
+}
+
+function Get-OfficialDataplaneTcpEvidence {
+    param(
+        [AllowNull()][object[]]$OfficialProcesses,
+        [AllowNull()][object[]]$TcpConnections
+    )
+
+    $officialProcesses = @($OfficialProcesses)
+    $officialPids = @($officialProcesses | ForEach-Object { ConvertTo-StatsNumber (Get-ObjectProperty -Object $_ -Name 'ProcessId') } | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+    $tcpAvailable = $true
+    $connections = $null
+    if ($PSBoundParameters.ContainsKey('TcpConnections') -and $null -ne $TcpConnections) {
+        $connections = @($TcpConnections)
+    }
+    else {
+        try { $connections = @(Get-NetTCPConnection -State Established -ErrorAction Stop) }
+        catch { $tcpAvailable = $false; $connections = @() }
+    }
+    $pidSet = @{}
+    foreach ($pidValue in $officialPids) { $pidSet[[string]$pidValue] = $true }
+    $gatewaySockets = [System.Collections.Generic.List[object]]::new()
+    $vortexSockets = [System.Collections.Generic.List[object]]::new()
+    $vortexPorts = [System.Collections.Generic.List[int]]::new()
+    foreach ($connection in $connections) {
+        $ownerPid = ConvertTo-StatsNumber (Get-ObjectProperty -Object $connection -Name 'OwningProcess')
+        if ($null -eq $ownerPid -or -not $pidSet.ContainsKey([string][int]$ownerPid)) { continue }
+        $remotePort = ConvertTo-StatsNumber (Get-ObjectProperty -Object $connection -Name 'RemotePort')
+        $remoteAddress = [string](Get-ObjectProperty -Object $connection -Name 'RemoteAddress')
+        $localPort = ConvertTo-StatsNumber (Get-ObjectProperty -Object $connection -Name 'LocalPort')
+        $state = [string](Get-ObjectProperty -Object $connection -Name 'State')
+        $detail = [ordered]@{
+            pid = [int]$ownerPid
+            remote_address = (ConvertTo-SafeText $remoteAddress)
+            remote_port = if ($null -ne $remotePort) { [int]$remotePort } else { $null }
+            local_port = if ($null -ne $localPort) { [int]$localPort } else { $null }
+            state = (ConvertTo-SafeText $state)
+        }
+        if ($remotePort -eq 18787) { [void]$gatewaySockets.Add([pscustomobject]$detail) }
+        if ($remotePort -in @(7897, 12450)) {
+            [void]$vortexSockets.Add([pscustomobject]$detail)
+            if (-not $vortexPorts.Contains([int]$remotePort)) { [void]$vortexPorts.Add([int]$remotePort) }
+        }
+    }
+    return [pscustomobject]@{
+        TcpAvailable = $tcpAvailable
+        OfficialPids = @($officialPids)
+        GatewaySocketObserved = $gatewaySockets.Count -gt 0
+        VortexSocketObserved = $vortexSockets.Count -gt 0
+        GatewaySockets = @($gatewaySockets)
+        VortexSockets = @($vortexSockets)
+        VortexPorts = @($vortexPorts | Sort-Object)
+    }
+}
+
+function Get-OfficialDataplaneMetricEntryInfo {
+    param([AllowNull()][object]$Entry)
+
+    if ($null -eq $Entry) {
+        return [pscustomobject]@{ Eligible = $false; Synthetic = $false; Reason = 'null_entry' }
+    }
+    $path = ''
+    foreach ($name in @('path', 'request_path', 'endpoint', 'url')) {
+        $candidate = [string](Get-ObjectProperty -Object $Entry -Name $name)
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) { $path = $candidate; break }
+    }
+    $markerValues = @()
+    foreach ($name in @('entrypoint', 'source_hint', 'user_agent_class', 'request_source')) {
+        $value = [string](Get-ObjectProperty -Object $Entry -Name $name)
+        if (-not [string]::IsNullOrWhiteSpace($value)) { $markerValues += $value.ToLowerInvariant() }
+    }
+    $syntheticId = [string](Get-ObjectProperty -Object $Entry -Name 'synthetic_run_id')
+    $synthetic = (Get-ObjectProperty -Object $Entry -Name 'synthetic') -eq $true -or -not [string]::IsNullOrWhiteSpace($syntheticId) -or @($markerValues | Where-Object { $_ -eq 'synthetic' }).Count -gt 0
+    if ($synthetic) {
+        return [pscustomobject]@{ Eligible = $false; Synthetic = $true; Reason = 'synthetic' }
+    }
+    if ($path -match '(?i)(?:^|/)(?:livez|health|stats|readyz)(?:/|$)' -or $path -match '(?i)/debug/warmup(?:/|$)' -or $path -match '(?i)^/v1/models/?(?:\?|$)') {
+        return [pscustomobject]@{ Eligible = $false; Synthetic = $false; Reason = 'internal_probe_path' }
+    }
+    if (@($markerValues | Where-Object { $_ -match '(?i)(?:internal|probe|monitor|health|livez|readyz|warmup|stats)' }).Count -gt 0) {
+        return [pscustomobject]@{ Eligible = $false; Synthetic = $false; Reason = 'internal_probe_marker' }
+    }
+    $category = [string](Get-ObjectProperty -Object $Entry -Name 'request_category')
+    if ([string]::IsNullOrWhiteSpace($category)) { $category = [string](Get-ObjectProperty -Object $Entry -Name 'category') }
+    $category = $category.ToLowerInvariant()
+    $eligible = $category -in @('responses', 'chat_completions', 'completions') -or $path -match '(?i)/v1/(?:responses|chat/completions|completions)(?:/|\?|$)'
+    if (-not $eligible) {
+        return [pscustomobject]@{ Eligible = $false; Synthetic = $false; Reason = if ($category -eq 'v1_other') { 'non_model_category' } else { 'unknown_category' } }
+    }
+    return [pscustomobject]@{ Eligible = $true; Synthetic = $false; Reason = $null }
+}
+
+function Get-OfficialDataplaneGatewayEvidence {
+    param(
+        [AllowNull()][string]$GatewayStatePath,
+        [AllowNull()][object]$GatewayState,
+        [AllowNull()][object]$PreviousCounters
+    )
+
+    $state = $GatewayState
+    if ($null -eq $state -and -not [string]::IsNullOrWhiteSpace($GatewayStatePath) -and (Test-Path -LiteralPath $GatewayStatePath -PathType Leaf)) {
+        try { $state = Get-Content -LiteralPath $GatewayStatePath -Raw -Encoding utf8 | ConvertFrom-Json } catch { $state = $null }
+    }
+    $counters = Get-ObjectProperty -Object $state -Name 'counters'
+    $current = [ordered]@{}
+    foreach ($name in @('total', 'ok', 'error', 'timeout')) {
+        $current[$name] = ConvertTo-StatsNumber (Get-ObjectProperty -Object $counters -Name $name)
+    }
+    $counterKnown = $null -ne $current.total
+    $previous = $PreviousCounters
+    $baselinePending = $false
+    $delta = $null
+    $hasExplicitPrevious = $PSBoundParameters.ContainsKey('PreviousCounters') -and $null -ne $PreviousCounters
+    if ($null -eq $previous -and -not $hasExplicitPrevious) {
+        $previous = $script:OfficialDataplaneGatewayBaseline
+    }
+    if ($counterKnown -and $null -eq $previous) {
+        $baselinePending = $true
+        $script:OfficialDataplaneGatewayBaseline = [pscustomobject]$current
+    }
+    elseif ($counterKnown -and $null -ne $previous) {
+        $delta = [ordered]@{}
+        foreach ($name in @('total', 'ok', 'error', 'timeout')) {
+            $before = ConvertTo-StatsNumber (Get-ObjectProperty -Object $previous -Name $name)
+            $after = $current[$name]
+            $delta[$name] = if ($null -ne $before -and $null -ne $after -and $after -ge $before) { [double]($after - $before) } else { $null }
+        }
+        if (-not $hasExplicitPrevious) { $script:OfficialDataplaneGatewayBaseline = [pscustomobject]$current }
+    }
+    $deltaDocument = [ordered]@{
+        available = $null -ne $delta
+        baseline_pending = $baselinePending
+        total = if ($null -ne $delta) { $delta.total } else { $null }
+        ok = if ($null -ne $delta) { $delta.ok } else { $null }
+        error = if ($null -ne $delta) { $delta.error } else { $null }
+        timeout = if ($null -ne $delta) { $delta.timeout } else { $null }
+    }
+    $recent = @((Get-ObjectProperty -Object $state -Name 'recent'))
+    $eligibleEntries = [System.Collections.Generic.List[object]]::new()
+    $excludedReasons = [System.Collections.Generic.List[string]]::new()
+    $syntheticIds = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in $recent) {
+        $info = Get-OfficialDataplaneMetricEntryInfo -Entry $entry
+        if ($info.Synthetic) {
+            $syntheticId = [string](Get-ObjectProperty -Object $entry -Name 'synthetic_run_id')
+            if (-not [string]::IsNullOrWhiteSpace($syntheticId)) { [void]$syntheticIds.Add((ConvertTo-SafeText $syntheticId)) }
+        }
+        if ($info.Eligible) { [void]$eligibleEntries.Add($entry) } else { [void]$excludedReasons.Add([string]$info.Reason) }
+    }
+    $deltaTotal = if ($null -ne $delta) { ConvertTo-StatsNumber $delta.total } else { $null }
+    if ($null -ne $deltaTotal -and $deltaTotal -gt 0 -and $eligibleEntries.Count -gt [int]$deltaTotal) {
+        $eligibleEntries = [System.Collections.Generic.List[object]]::new([object[]]@($eligibleEntries | Select-Object -Last ([int]$deltaTotal)))
+    }
+    $requestIds = @($eligibleEntries | ForEach-Object { [string](Get-ObjectProperty -Object $_ -Name 'request_id') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { ConvertTo-SafeText $_ } | Select-Object -Unique)
+    $correlationIds = @($eligibleEntries | ForEach-Object { [string](Get-ObjectProperty -Object $_ -Name 'correlation_id') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { ConvertTo-SafeText $_ } | Select-Object -Unique)
+    $userAgentClasses = @($eligibleEntries | ForEach-Object { [string](Get-ObjectProperty -Object $_ -Name 'user_agent_class') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { ConvertTo-SafeText $_ } | Select-Object -Unique)
+    $entrypoints = @($eligibleEntries | ForEach-Object { [string](Get-ObjectProperty -Object $_ -Name 'entrypoint') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { ConvertTo-SafeText $_ } | Select-Object -Unique)
+    $sourceHints = @($eligibleEntries | ForEach-Object { [string](Get-ObjectProperty -Object $_ -Name 'source_hint') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { ConvertTo-SafeText $_ } | Select-Object -Unique)
+    $targets = @($eligibleEntries | ForEach-Object {
+            $target = [string](Get-ObjectProperty -Object $_ -Name 'upstream_target')
+            if (-not [string]::IsNullOrWhiteSpace($target)) { $target }
+            else { @((Get-ObjectProperty -Object $_ -Name 'upstream_targets')) | ForEach-Object { [string]$_ } }
+        } | ForEach-Object {
+            $candidate = [string]$_
+            if ($candidate -match '(?i)^(headroom|helper|relay)$') { ConvertTo-SafeText $candidate }
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    $syntheticRunId = if (@($syntheticIds | Select-Object -Unique).Count -eq 1) { [string](@($syntheticIds | Select-Object -Unique)[0]) } else { $null }
+    return [pscustomobject]@{
+        Available = $null -ne $state
+        CounterKnown = $counterKnown
+        CurrentCounters = [pscustomobject]$current
+        CounterDelta = [pscustomobject]$deltaDocument
+        BaselinePending = $baselinePending
+        EligibleEntries = @($eligibleEntries)
+        RequestIds = @($requestIds)
+        CorrelationIds = @($correlationIds)
+        UserAgentClasses = @($userAgentClasses)
+        Entrypoints = @($entrypoints)
+        SourceHints = @($sourceHints)
+        UpstreamTargets = @($targets)
+        UpstreamEvidence = $targets.Count -gt 0
+        SyntheticRunId = $syntheticRunId
+        ExcludedReasons = @($excludedReasons | Select-Object -Unique)
+    }
+}
+
+function New-EmptyOfficialDataplaneDocument {
+    param([AllowNull()][string]$ObservedAt)
+    if ([string]::IsNullOrWhiteSpace($ObservedAt)) { $ObservedAt = [DateTime]::UtcNow.ToString('o') }
+    return [pscustomobject][ordered]@{
+        observed_at = $ObservedAt
+        official_pids = @()
+        gateway_socket_observed = $false
+        vortex_socket_observed = $false
+        vortex_ports = @()
+        gateway_counter_delta = [ordered]@{ available = $false; baseline_pending = $true; total = $null; ok = $null; error = $null; timeout = $null }
+        gateway_request_ids = @()
+        gateway_correlation_ids = @()
+        correlation_ids = @()
+        gateway_user_agent_classes = @()
+        gateway_entrypoints = @()
+        gateway_source_hints = @()
+        upstream_targets = @()
+        classification = 'unknown'
+        basis = @('no_official_process_evidence')
+        synthetic_run_id = $null
+    }
+}
+
+function Get-OfficialDataplaneSnapshot {
+    param(
+        [AllowNull()][object]$Processes,
+        [AllowNull()][string]$GatewayStatePath,
+        [AllowNull()][object]$GatewayState,
+        [AllowNull()][object[]]$TcpConnections,
+        [AllowNull()][object]$PreviousCounters,
+        [AllowNull()][string]$ObservedAt
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ObservedAt)) { $ObservedAt = [DateTime]::UtcNow.ToString('o') }
+    $officialProcesses = if ($null -ne $Processes -and $null -ne (Get-ObjectProperty -Object $Processes -Name 'OfficialDesktop')) { @($Processes.OfficialDesktop) } else { @(Get-OfficialDesktopProcessInventory) }
+    $tcp = Get-OfficialDataplaneTcpEvidence -OfficialProcesses $officialProcesses -TcpConnections:$TcpConnections
+    $gateway = Get-OfficialDataplaneGatewayEvidence -GatewayStatePath $GatewayStatePath -GatewayState $GatewayState -PreviousCounters $PreviousCounters
+    $basis = [System.Collections.Generic.List[string]]::new()
+    if ($tcp.GatewaySocketObserved) { [void]$basis.Add('official_pid_tcp_18787') } else { [void]$basis.Add('no_official_pid_tcp_18787') }
+    if ($tcp.VortexSocketObserved) {
+        foreach ($port in @($tcp.VortexPorts)) { [void]$basis.Add("official_pid_tcp_vortex_$port") }
+    }
+    if ($gateway.BaselinePending) { [void]$basis.Add('gateway_baseline_pending') }
+    if ($gateway.CounterDelta.available -and (ConvertTo-StatsNumber $gateway.CounterDelta.total) -gt 0) { [void]$basis.Add('gateway_counter_delta') } else { [void]$basis.Add('no_gateway_counter_delta') }
+    if ($gateway.RequestIds.Count -gt 0 -or $gateway.CorrelationIds.Count -gt 0) { [void]$basis.Add('gateway_request_correlation') } else { [void]$basis.Add('no_gateway_request_correlation') }
+    $gatewayCodexEntrypoints = @($gateway.Entrypoints | Where-Object { $_ -match '(?i)codex' })
+    if ($gatewayCodexEntrypoints.Count -gt 0) { [void]$basis.Add("gateway_codex_entrypoint") } else { [void]$basis.Add('no_gateway_codex_entrypoint') }
+    if ($gateway.UpstreamEvidence) { [void]$basis.Add('upstream_target_evidence') } else { [void]$basis.Add('no_upstream_target_evidence') }
+    if ($gateway.ExcludedReasons -contains 'synthetic') { [void]$basis.Add('synthetic_entries_excluded') }
+    if (-not $tcp.TcpAvailable) { [void]$basis.Add('tcp_sample_unavailable') }
+    $hasGatewayDelta = $gateway.CounterDelta.available -and (ConvertTo-StatsNumber $gateway.CounterDelta.total) -gt 0
+    # The official app-server connects to Gateway only for the duration of a
+    # request (short-lived sockets), so a point-in-time TCP sample frequently
+    # misses gateway_socket_observed even when the dataplane is healthy.  A
+    # gateway request whose entrypoint/source_hint/user_agent marks it as
+    # codex is durable evidence the official dataplane went through Headroom.
+    $gatewayCodexRequest = ($gateway.RequestIds.Count -gt 0 -or $gateway.CorrelationIds.Count -gt 0) -and $gatewayCodexEntrypoints.Count -gt 0
+    $confirmed = (($tcp.GatewaySocketObserved -and $hasGatewayDelta) -or $gatewayCodexRequest) -and $gateway.UpstreamEvidence
+    $classification = if ($confirmed) { 'confirmed' } elseif ($tcp.VortexSocketObserved -and -not $gatewayCodexRequest) { 'bypass' } else { 'unknown' }
+    return [pscustomobject][ordered]@{
+        observed_at = $ObservedAt
+        official_pids = @($tcp.OfficialPids)
+        gateway_socket_observed = [bool]$tcp.GatewaySocketObserved
+        vortex_socket_observed = [bool]$tcp.VortexSocketObserved
+        vortex_ports = @($tcp.VortexPorts)
+        gateway_counter_delta = $gateway.CounterDelta
+        gateway_request_ids = @($gateway.RequestIds)
+        gateway_correlation_ids = @($gateway.CorrelationIds)
+        correlation_ids = @($gateway.CorrelationIds)
+        gateway_user_agent_classes = @($gateway.UserAgentClasses)
+        gateway_entrypoints = @($gateway.Entrypoints)
+        gateway_source_hints = @($gateway.SourceHints)
+        upstream_targets = @($gateway.UpstreamTargets)
+        classification = $classification
+        basis = @($basis | Select-Object -Unique)
+        synthetic_run_id = $gateway.SyntheticRunId
     }
 }
 
@@ -1978,26 +2726,107 @@ function Test-ManagedCodexProcessState {
     catch { return $false }
     $entries = @((Get-ObjectProperty $state 'processes'))
     if ($entries.Count -ne 2) { return $false }
-    foreach ($entry in $entries) {
-        $processId = ConvertTo-StatsNumber (Get-ObjectProperty $entry 'pid')
-        if ($null -eq $processId -or [Math]::Floor($processId) -ne $processId -or $processId -le 0) { return $false }
-        $snapshot = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$processId)" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -eq $snapshot) { return $false }
+    # Match the complete exact executable set, not only the PIDs recorded in
+    # state.  This makes stale state fail closed when a duplicate client is
+    # still alive after a previous direct or managed launch.
+    $currentProcesses = @(Get-MonitorExactCodexProcessInventory)
+    if ($currentProcesses.Count -ne 2) { return $false }
+    foreach ($expectedPathValue in @($script:CodexPlusPlusExecutablePath, $script:CodexPlusPlusManagerExecutablePath)) {
+        if (@($currentProcesses | Where-Object {
+                [string]::Equals([string]$_.ExecutablePath, [string]$expectedPathValue, [StringComparison]::OrdinalIgnoreCase)
+            }).Count -ne 1) {
+            return $false
+        }
+    }
+    $seenProcessIds = @{}
+    foreach ($current in $currentProcesses) {
+        $processId = [int]$current.ProcessId
+        if ($processId -le 0 -or $seenProcessIds.ContainsKey([string]$processId)) { return $false }
+        $seenProcessIds[[string]$processId] = $true
+        $entry = @($entries | Where-Object {
+                $entryId = ConvertTo-StatsNumber (Get-ObjectProperty $_ 'pid')
+                $null -ne $entryId -and [Math]::Floor($entryId) -eq $entryId -and [int]$entryId -eq $processId
+            } | Select-Object -First 1)
+        if ($entry.Count -ne 1) { return $false }
         try {
-            $actualPath = [IO.Path]::GetFullPath((Get-MonitorProcessExecutablePath -ProcessId ([int]$processId)))
-            $expectedPath = [IO.Path]::GetFullPath([string](Get-ObjectProperty $entry 'executable_path'))
+            $expectedPath = [IO.Path]::GetFullPath([string](Get-ObjectProperty $entry[0] 'executable_path'))
+            $actualPath = [IO.Path]::GetFullPath([string]$current.ExecutablePath)
         }
         catch { return $false }
         if (-not $actualPath.Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase)) { return $false }
-        $process = Get-Process -Id ([int]$processId) -ErrorAction SilentlyContinue
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
         if ($null -eq $process) { return $false }
         try {
-            $expectedStartedAt = ConvertTo-MonitorUtcDateTimeValue -Value (Get-ObjectProperty $entry 'started_at_utc')
+            $expectedStartedAt = ConvertTo-MonitorUtcDateTimeValue -Value (Get-ObjectProperty $entry[0] 'started_at_utc')
             if ($null -eq $expectedStartedAt) { return $false }
             if ([Math]::Abs(($process.StartTime.ToUniversalTime() - $expectedStartedAt).TotalSeconds) -gt 2) { return $false }
         }
         catch { return $false }
     }
+    return $seenProcessIds.Count -eq 2
+}
+
+function Update-StaleManagedCodexState {
+    # Self-healing refresh: when the process-scope route contract is valid but
+    # the managed-process snapshot is stale (for example the exact Manager and
+    # Client were restarted outside the startup chain), re-observe the live
+    # exact process set and atomically refresh managed-codex-processes.json.
+    # Fail-closed: refresh only when the live set is precisely one Manager and
+    # one Client at the expected executable paths, and only when the snapshot
+    # PIDs actually differ from the live PIDs.
+    $state = $null
+    if (Test-Path -LiteralPath $script:ManagedCodexStatePath -PathType Leaf) {
+        try { $state = Get-Content -LiteralPath $script:ManagedCodexStatePath -Raw | ConvertFrom-Json } catch { $state = $null }
+    }
+    if ($null -eq $state -or [int](Get-ObjectProperty $state 'schema_version') -ne 1 -or [string](Get-ObjectProperty $state 'route_scope') -ne 'process') { return $false }
+    $stateRoutePath = [string](Get-ObjectProperty $state 'route_state_path')
+    try {
+        if (-not [IO.Path]::GetFullPath($stateRoutePath).Equals([IO.Path]::GetFullPath($script:RouteStatePath), [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    catch { return $false }
+
+    $currentProcesses = @(Get-MonitorExactCodexProcessInventory)
+    if ($currentProcesses.Count -ne 2) { return $false }
+    foreach ($expectedPathValue in @($script:CodexPlusPlusExecutablePath, $script:CodexPlusPlusManagerExecutablePath)) {
+        if (@($currentProcesses | Where-Object {
+                [string]::Equals([string]$_.ExecutablePath, [string]$expectedPathValue, [StringComparison]::OrdinalIgnoreCase)
+            }).Count -ne 1) {
+            return $false
+        }
+    }
+
+    $livePids = @($currentProcesses | ForEach-Object { [int]$_.ProcessId } | Sort-Object)
+    $statePids = @($state.processes | ForEach-Object { [int](Get-ObjectProperty $_ 'pid') } | Sort-Object)
+    if (($livePids -join ',') -eq ($statePids -join ',')) { return $false }
+
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($current in $currentProcesses) {
+        $processId = [int]$current.ProcessId
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        if ($null -eq $process) { return $false }
+        [void]$entries.Add([ordered]@{
+                pid = $processId
+                executable_path = [string]$current.ExecutablePath
+                started_at_utc = $process.StartTime.ToUniversalTime().ToString('o')
+            })
+    }
+    if ($entries.Count -ne 2) { return $false }
+    $document = [ordered]@{
+        schema_version = 1
+        route_scope = 'process'
+        route_state_path = $script:RouteStatePath
+        source_hashes = (Get-ObjectProperty $state 'source_hashes')
+        processes = @($entries)
+        updated_at_utc = [DateTime]::UtcNow.ToString('o')
+    }
+    try {
+        Write-AtomicUtf8Text -Path $script:ManagedCodexStatePath -Content (($document | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
+    }
+    catch {
+        Write-MonitorLog -Level WARN -Message 'Unable to refresh stale managed Codex process state.'
+        return $false
+    }
+    Write-MonitorLog -Level INFO -Message 'Refreshed stale managed-codex-processes.json from the live exact process set.'
     return $true
 }
 
@@ -2010,6 +2839,15 @@ function Get-ClientRouteObservation {
 
     $activeClient = @($Processes.CodexPlusPlus).Count -gt 0 -or @($Processes.Manager).Count -gt 0
     $managedProcessesReady = Test-ManagedCodexProcessState
+    if (-not $managedProcessesReady -and $activeClient) {
+        # Re-observe before declaring a mismatch: the exact Manager/Client may
+        # have restarted outside the startup chain, leaving a stale snapshot.
+        # Update-StaleManagedCodexState is fail-closed (exact 2-process set at
+        # the expected paths and differing PIDs required); a failed refresh
+        # leaves the snapshot untouched so the monitor stays red.
+        [void](Update-StaleManagedCodexState)
+        $managedProcessesReady = Test-ManagedCodexProcessState
+    }
     $routeState = $null
     if (Test-Path -LiteralPath $script:RouteStatePath -PathType Leaf) {
         try { $routeState = Get-Content -LiteralPath $script:RouteStatePath -Raw | ConvertFrom-Json } catch { $routeState = $null }
@@ -2026,6 +2864,7 @@ function Get-ClientRouteObservation {
             $keeperProcess = if ($null -ne $keeperPid -and [Math]::Floor($keeperPid) -eq $keeperPid) { Get-Process -Id ([int]$keeperPid) -ErrorAction SilentlyContinue } else { $null }
             $keeperInfo = if ($null -ne $keeperProcess) { Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$keeperPid)" -ErrorAction SilentlyContinue } else { $null }
             $keeperCommand = if ($keeperInfo) { [string]$keeperInfo.CommandLine } else { '' }
+            $keeperIdentityValid = Test-MonitorRouteKeeperIdentity -RouteState $routeState -KeeperProcess $keeperProcess -KeeperInfo $keeperInfo -CommandLine $keeperCommand
             $routeValid = (
                 $fresh -and
                 [int](Get-ObjectProperty $routeState 'schema_version') -eq 3 -and
@@ -2039,9 +2878,7 @@ function Get-ClientRouteObservation {
                 [string](Get-ObjectProperty $routeState 'route_keeper_config_path') -eq $script:CodexPlusPlusConfigPath -and
                 [string](Get-ObjectProperty $routeState 'route_keeper_script_path') -eq $script:RouteKeeperPath -and
                 [string](Get-ObjectProperty $routeState 'route_keeper_mode') -eq 'watch' -and
-                $null -ne $keeperProcess -and
-                $keeperCommand -match ('(?i)' + [regex]::Escape($script:RouteKeeperPath)) -and
-                $keeperCommand -match '(?i)(^|\s)-Watch(\s|$)'
+                $keeperIdentityValid
             )
         }
         catch { $routeValid = $false }
@@ -2287,6 +3124,13 @@ function Get-MonitorSnapshot {
     $codexPlusPlusConfig = Get-CodexConfigSnapshot -Path $script:CodexPlusPlusConfigPath
     $codexConfig = Get-CodexConfigSnapshot -Path $script:CodexConfigPath
     $processes = Get-ProcessSnapshot
+    $officialDataplane = Get-OfficialDataplaneSnapshot -Processes $processes -GatewayStatePath $script:GatewayStatePath
+    if ([string]$officialDataplane.classification -eq 'bypass') {
+        Add-MonitorWarning -List $warnings -Code 'official_dataplane.bypass' -Message 'Official desktop traffic has a Vortex 7897/12450 socket and is not confirmed through Gateway 18787.'
+    }
+    elseif ([string]$officialDataplane.classification -eq 'unknown') {
+        Add-MonitorWarning -List $warnings -Code 'official_dataplane.unknown' -Message 'Official desktop data-plane evidence is incomplete; managed route health does not prove the current official model path.'
+    }
     $route = Get-ClientRouteObservation -CodexPlusPlusConfig $codexPlusPlusConfig -CodexConfig $codexConfig -Processes $processes
     if ($route.RouteMismatch) {
         Add-MonitorIssue -List $issues -Code 'route_keeper_failed' -Message $route.Detail
@@ -2314,6 +3158,7 @@ function Get-MonitorSnapshot {
         CriticalIssues = @($issues)
         Warnings = @($warnings)
         Processes = $processes
+        OfficialDataplane = $officialDataplane
         ApiRequestObservation = $trafficObservation
         TrafficObservation = $trafficObservation
         Traffic = $traffic

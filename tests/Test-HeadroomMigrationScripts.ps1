@@ -28,7 +28,7 @@ $desktopText = Get-Content -LiteralPath $desktopPath -Raw
 foreach ($needle in @('remove_source_requires_execute','Get-FileHash','Get-Acl','retain_for_loader','unscoped_backup_names','Assert-DestinationInsideProject')) {
     Assert-True -Condition ($moveText.Contains($needle)) -Message ("move_static:" + $needle)
 }
-foreach ($needle in @('remove_legacy_requires_execute','Get-ScheduledTask','Get-NetFirewallRule','Export-ScheduledTask','backups\\system-cutover','planned_actions')) {
+foreach ($needle in @('remove_legacy_requires_execute','Get-ScheduledTask','Get-NetFirewallRule','Export-ScheduledTask','backups\\system-cutover','planned_actions','SLDF_RUNAS_USER','0x00001000','desktop_shortcut_runas_flag_missing','desktopLauncherArguments','--phase-b')) {
     Assert-True -Condition ($desktopText.Contains($needle)) -Message ("desktop_static:" + $needle)
 }
 

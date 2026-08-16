@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 
 _DEVICE_LOSS_CODES = ("887a0005", "887a0006", "887a0007", "887a0020")
 _ERROR_CODE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+_OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 _READER_EOF = object()
 
 
@@ -75,6 +76,16 @@ def _safe_error_code(value: Any, default: str) -> str:
     ):
         return "device_lost"
     return default
+
+
+def _safe_opaque_id(value: Any, prefix: str) -> str:
+    """Normalize request identifiers without ever persisting request text."""
+
+    if isinstance(value, str):
+        candidate = value.strip()
+        if _OPAQUE_ID_RE.fullmatch(candidate):
+            return candidate
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 
 def _request_failure_code(exc: BaseException) -> str:
@@ -370,6 +381,9 @@ class BrokerState:
             "device_removal": 0,
             "error": 0,
         }
+        # A bounded, body-free receipt trail lets Gateway/Headroom evidence
+        # correlate one compression attempt without storing prompt text.
+        self.recent_requests: list[dict[str, Any]] = []
 
     def _persist(self) -> None:
         path = self.config.state_path
@@ -384,6 +398,7 @@ class BrokerState:
             "circuit_open": self.circuit_open,
             "queue_limit": self.config.queue_limit,
             "counters": dict(self.counters),
+            "recent_requests": list(self.recent_requests[-32:]),
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -459,9 +474,11 @@ class BrokerState:
         reason: str,
         error_code: str,
         latency_ms: float,
+        request_id: str | None = None,
+        correlation_id: str | None = None,
     ) -> dict[str, Any]:
         tokens = len(content.split())
-        return {
+        body = {
             "compressed": content,
             "original_tokens": tokens,
             "compressed_tokens": tokens,
@@ -474,6 +491,39 @@ class BrokerState:
             "error_code": _safe_error_code(error_code, "provider_error"),
             "latency_ms": round(max(0.0, latency_ms), 3),
         }
+        if request_id is not None:
+            body["request_id"] = request_id
+        if correlation_id is not None:
+            body["correlation_id"] = correlation_id
+        return body
+
+    def record_request(
+        self,
+        *,
+        request_id: str,
+        correlation_id: str,
+        status: str,
+        error_code: str | None = None,
+        latency_ms: float | None = None,
+    ) -> None:
+        """Persist a bounded, sanitized per-request broker receipt."""
+
+        receipt: dict[str, Any] = {
+            "request_id": _safe_opaque_id(request_id, "broker"),
+            "correlation_id": _safe_opaque_id(correlation_id, "corr"),
+            "status": _safe_text(status, "unknown"),
+        }
+        if error_code:
+            receipt["error_code"] = _safe_error_code(error_code, "provider_error")
+        if latency_ms is not None:
+            try:
+                receipt["latency_ms"] = round(max(0.0, float(latency_ms)), 3)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        with self._state_lock:
+            self.recent_requests.append(receipt)
+            del self.recent_requests[:-32]
+            self._persist()
 
     def record(self, name: str) -> None:
         with self._state_lock:
@@ -613,6 +663,7 @@ def create_app(
             "circuit_open": state.circuit_open,
             "queue_limit": cfg.queue_limit,
             "counters": dict(state.counters),
+            "recent_requests": list(state.recent_requests[-32:]),
         }
 
     @app.get("/readyz")
@@ -633,6 +684,18 @@ def create_app(
         if not isinstance(payload, dict) or not isinstance(payload.get("content"), str):
             return _json_error(400, "invalid_request", "content_must_be_string")
         content = payload["content"]
+        request_id = _safe_opaque_id(payload.get("request_id"), "broker")
+        correlation_id = _safe_opaque_id(payload.get("correlation_id"), "corr")
+
+        def record_receipt(status: str, error_code: str | None = None) -> None:
+            state.record_request(
+                request_id=request_id,
+                correlation_id=correlation_id,
+                status=status,
+                error_code=error_code,
+                latency_ms=(time.perf_counter() - started) * 1000,
+            )
+
         try:
             content_bytes = len(content.encode("utf-8"))
         except UnicodeEncodeError:
@@ -659,7 +722,10 @@ def create_app(
                 reason="queue_full",
                 error_code="queue_full",
                 latency_ms=(time.perf_counter() - started) * 1000,
+                request_id=request_id,
+                correlation_id=correlation_id,
             )
+            record_receipt("passthrough", "queue_full")
             return JSONResponse(status_code=200, content=body)
 
         worker_lock_acquired = False
@@ -672,31 +738,35 @@ def create_app(
                 worker_lock_acquired = True
             except asyncio.TimeoutError:
                 state.record("queue_full")
-                return JSONResponse(
-                    status_code=200,
-                    content=state.passthrough(
-                        content,
-                        reason="queue_full",
-                        error_code="queue_full",
-                        latency_ms=(time.perf_counter() - started) * 1000,
-                    ),
+                body = state.passthrough(
+                    content,
+                    reason="queue_full",
+                    error_code="queue_full",
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    request_id=request_id,
+                    correlation_id=correlation_id,
                 )
+                record_receipt("passthrough", "queue_full")
+                return JSONResponse(status_code=200, content=body)
             if not state.ready or state.circuit_open:
                 state.record("passthrough")
-                return JSONResponse(
-                    status_code=200,
-                    content=state.passthrough(
-                        content,
-                        reason="provider_not_ready",
-                        error_code="provider_not_ready",
-                        latency_ms=(time.perf_counter() - started) * 1000,
-                    ),
+                body = state.passthrough(
+                    content,
+                    reason="provider_not_ready",
+                    error_code="provider_not_ready",
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    request_id=request_id,
+                    correlation_id=correlation_id,
                 )
+                record_receipt("passthrough", "provider_not_ready")
+                return JSONResponse(status_code=200, content=body)
             worker_payload = {
                 "id": uuid.uuid4().hex,
                 "op": "compress",
                 "content": content,
                 "target_ratio": ratio,
+                "request_id": request_id,
+                "correlation_id": correlation_id,
             }
             try:
                 response = await asyncio.wait_for(
@@ -713,15 +783,16 @@ def create_app(
                 except Exception:
                     pass
                 state.bump("worker_restart")
-                return JSONResponse(
-                    status_code=200,
-                    content=state.passthrough(
-                        content,
-                        reason="provider_timeout",
-                        error_code="provider_timeout",
-                        latency_ms=(time.perf_counter() - started) * 1000,
-                    ),
+                body = state.passthrough(
+                    content,
+                    reason="provider_timeout",
+                    error_code="provider_timeout",
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    request_id=request_id,
+                    correlation_id=correlation_id,
                 )
+                record_receipt("passthrough", "provider_timeout")
+                return JSONResponse(status_code=200, content=body)
             except Exception as exc:
                 state.record("error")
                 state.ready = False
@@ -733,15 +804,16 @@ def create_app(
                     pass
                 state.bump("worker_restart")
                 failure_code = _request_failure_code(exc)
-                return JSONResponse(
-                    status_code=200,
-                    content=state.passthrough(
-                        content,
-                        reason="worker_error" if failure_code == "worker_error" else failure_code,
-                        error_code=failure_code,
-                        latency_ms=(time.perf_counter() - started) * 1000,
-                    ),
+                body = state.passthrough(
+                    content,
+                    reason="worker_error" if failure_code == "worker_error" else failure_code,
+                    error_code=failure_code,
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    request_id=request_id,
+                    correlation_id=correlation_id,
                 )
+                record_receipt("passthrough", failure_code)
+                return JSONResponse(status_code=200, content=body)
 
             normalized = _normalise_success(
                 response,
@@ -763,17 +835,21 @@ def create_app(
                     except Exception:
                         pass
                 state.record("error")
-                return JSONResponse(
-                    status_code=200,
-                    content=state.passthrough(
-                        content,
-                        reason="provider_error",
-                        error_code=error_code,
-                        latency_ms=(time.perf_counter() - started) * 1000,
-                    ),
+                body = state.passthrough(
+                    content,
+                    reason="provider_error",
+                    error_code=error_code,
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    request_id=request_id,
+                    correlation_id=correlation_id,
                 )
+                record_receipt("passthrough", error_code)
+                return JSONResponse(status_code=200, content=body)
             normalized["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
+            normalized["request_id"] = request_id
+            normalized["correlation_id"] = correlation_id
             state.record("compressed" if normalized["status"] == "compressed" else "passthrough")
+            record_receipt(str(normalized["status"]))
             return JSONResponse(status_code=200, content=normalized)
         finally:
             if worker_lock_acquired:

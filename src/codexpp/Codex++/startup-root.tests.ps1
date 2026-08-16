@@ -39,9 +39,11 @@ $manager = Read-Source -RelativePath 'src\codexpp\Codex++\codex-manager-bootstra
 $wrapper = Read-Source -RelativePath 'src\codexpp\Codex++\codex-wrapper-bootstrap.vbs'
 $legacy = Read-Source -RelativePath 'src\codexpp\Codex++\codexpp-simple-launcher.vbs'
 $launch = Read-Source -RelativePath 'scripts\Launch-HeadroomForCodexPP.vbs'
+$visibleLauncher = Read-Source -RelativePath 'scripts\Start-HeadroomWithProgress.ps1'
 
 foreach ($path in @(
         'scripts\Start-HeadroomForCodexPP.ps1',
+        'scripts\Start-HeadroomWithProgress.ps1',
         'src\codexpp\Codex++\codexpp-startup-gate.ps1',
         'src\codexpp\Codex++\codexpp-route-keeper.ps1',
         'src\headroom\codexpp-headroom\reconcile-codexpp.ps1',
@@ -50,7 +52,8 @@ foreach ($path in @(
     Assert-Parser -RelativePath $path
 }
 
-Assert-True -Condition ($launch -match '(?i)Start-HeadroomForCodexPP\.ps1' -and $launch -match 'WScript\.ScriptFullName' -and $launch -match 'QuoteArg' -and $launch -match 'ShellExecute' -and $launch -match '"runas"') -Message 'root VBS delegates to the quoted elevated root PowerShell entry'
+Assert-True -Condition ($launch -match '(?i)Start-HeadroomWithProgress\.ps1' -and $launch -match 'WScript\.ScriptFullName' -and $launch -match 'QuoteArg' -and $launch -match 'ShellExecute' -and $launch -match '"runas"' -and $launch -match ', 1' -and $launch -match 'WindowStyle Normal' -and $launch -notmatch 'WindowStyle Hidden' -and $launch -match '--phase-b' -and $start -match '\$PhaseB') -Message 'root VBS delegates to the visible elevated progress launcher and supports deferred PHASE-B activation'
+Assert-True -Condition ($visibleLauncher -match 'Start-HeadroomForCodexPP\.ps1' -and $visibleLauncher -match 'headroom-start-result\.json' -and $visibleLauncher -match 'OverallTimeoutSeconds' -and $visibleLauncher -match 'Read-FreshStartResult' -and $visibleLauncher -match 'Read-Host' -and $visibleLauncher -match 'SuccessDisplaySeconds' -and $visibleLauncher -match 'NoPauseOnFailure') -Message 'visible launcher has bounded progress, stale-result protection, success auto-close and failure pause'
 Assert-True -Condition ($start -match '\$BrokerPort\s*=\s*18790' -and $start -match '/readyz' -and $start -match 'HEADROOM_KOMPRESS_ENDPOINT') -Message 'broker fixed port and endpoint are hard gates'
 Assert-True -Condition ($start -match 'kompress_broker\.app:app' -and $start -match 'source_hash' -and $start -match 'config_sha256' -and $start -match 'route_state') -Message 'module/hash/config/route evidence is required'
 Assert-True -Condition ($start -match 'KompressEndpoint' -and $start -match "status.*-ne\s*'deferred'" -and $start -match 'Stop-ManagedProcessGracefully') -Message 'deferred readiness and graceful broker shutdown are covered'
@@ -65,7 +68,11 @@ Assert-True -Condition ($start -match 'function\s+Ensure-Monitor' -and $start -m
 Assert-True -Condition ($start -match 'function\s+Test-GatewayReadinessSnapshot' -and $start -match 'AllowRelayPending' -and $start -match 'readiness_failed_after_client') -Message 'root readiness has an explicit pre-client relay-pending phase and post-client full gate'
 Assert-True -Condition ($start -match 'function\s+Wait-StrictReadiness' -and $start -match '\$postClientDeadline' -and $start -match 'Wait-StrictReadiness\s+-DeadlineUtc\s+\$postClientDeadline' -and $start -match 'Start-Sleep -Milliseconds 500') -Message 'post-client strict readiness waits within a bounded polling budget'
 Assert-True -Condition ($start -match 'function\s+Test-RouteStateContract' -and $start -match 'route_state_contract_invalid_before_managed_state' -and $start -match 'managed_codex_state_identity_invalid_after_readiness') -Message 'root validates process route state and managed identity around state publication'
-Assert-True -Condition ($start -match 'function\s+ConvertTo-UtcDateTimeValue' -and $start -match 'DateTimeStyles\]::RoundtripKind' -and $start -match 'ConvertTo-UtcDateTimeValue\s+-Value\s+\$entry\.started_at_utc') -Message 'managed state timestamps use typed UTC conversion without stringifying DateTime'
+Assert-True -Condition ($start -match 'function\s+Invoke-PhaseBActivation' -and $start -match 'phase_b_requires_codexpp_quiescent' -and $start -match 'Remove-HeadroomAggregateRelay\.ps1' -and $start -match 'Register-HeadroomUserScript\.ps1' -and $start -match '\$PhaseB') -Message 'PHASE-B mutations are deferred behind an explicit quiescent-process gate'
+Assert-True -Condition ($start -match 'function\s+Get-ConfigProtectedContract' -and $start -match 'function\s+Test-ConfigProtectedContract' -and $start -match 'manager_config_protected_contract_changed_during_startup' -and $start -match 'config_changed_after_manager') -Message 'manager metadata changes are allowed only when provider and Base URL protections remain unchanged'
+Assert-True -Condition ($start -match 'function\s+ConvertTo-UtcDateTimeValue' -and $start -match 'DateTimeStyles\]::RoundtripKind' -and $start -match 'ConvertTo-UtcDateTimeValue\s+-Value\s+\$entry(?:\[0\])?\.started_at_utc') -Message 'managed state timestamps use typed UTC conversion without stringifying DateTime'
+Assert-True -Condition ($start -match 'Get-ExactExecutableProcesses\s+-ExecutablePaths\s+@\(\$managerExe,\s*\$clientExe\)' -and $start -match 'currentProcesses\.Count\s+-ne\s*2' -and $start -match 'seenProcessIds') -Message 'managed state requires the complete exact Manager/Client process set'
+Assert-True -Condition ($start -match 'function\s+Test-StaleRouteKeeperIdentity' -and $start -match 'function\s+Stop-StaleRouteKeeper' -and $start -match 'stale_route_keeper_identity_ambiguous' -and $start -match 'routeWatchStatePath' -and $start -match 'Get-ExactExecutableProcesses') -Message 'cold start reclaims only a verified stale route watcher'
 $managedStateCallIndex = $start.IndexOf("if (-not `$managedAlready) {`n            Write-ManagedCodexState")
 $postClientWaitIndex = $start.IndexOf("if (-not (Wait-StrictReadiness -DeadlineUtc `$postClientDeadline)) { throw 'readiness_failed_after_client' }")
 $managerReadinessIndex = if ($postClientWaitIndex -ge 0) { $start.IndexOf('Invoke-ManagerReadiness', $postClientWaitIndex) } else { -1 }
@@ -91,11 +98,13 @@ Assert-True -Condition ($start -match 'runtimeRoot\s*=\s*Join-Path\s+\$projectRo
 Assert-True -Condition ($headroomStart -match 'HEADROOM_WORKSPACE_DIR' -and $headroomStart -match 'HEADROOM_CONFIG_DIR' -and $headroomEnsure -match 'HEADROOM_WORKSPACE_DIR' -and $headroomEnsure -match 'HEADROOM_CONFIG_DIR') -Message 'Headroom official workspace/config paths are pinned under the project root'
 Assert-True -Condition ($start -match 'HEADROOM_WORKSPACE_DIR' -and $start -match 'HEADROOM_CONFIG_DIR') -Message 'Kompress broker inherits the project-root Headroom workspace/config paths'
 Assert-True -Condition (($start + $headroomStart + $headroomEnsure + $manager + $wrapper) -notmatch '(?i)\.headroom-venv|runtime-artifacts|AppData\\Roaming\\Codex\+\+\\codexpp-(?:route|headroom)') -Message 'active startup chain has no legacy C-drive Headroom runtime path'
+Assert-True -Condition ($start -match 'fastPathServicesOk\s*=\s*\$false' -and $start -match 'Port presence alone is not proof') -Message 'startup root does not trust a port-only fast path'
 Assert-True -Condition ($headroomLauncher -match 'HEADROOM_KOMPRESS_ENDPOINT' -and $headroomLauncher -match 'broker owns remote warmup') -Message 'Headroom launcher does not create a duplicate local Kompress session'
 Assert-True -Condition ($installRuntime -match '--no-index' -and $installRuntime -match 'requirements-lock\.txt' -and $installRuntime -match 'patch_hash_mismatch') -Message 'runtime can be rebuilt from the offline wheelhouse with verified patches'
 Assert-True -Condition ($monitor -match 'ManagedCodexStatePath' -and $monitor -match 'kompress_broker\s*=' -and $monitor -match "schema_version'\)\s*-eq\s*3" -and $monitor -match "route_scope'\)\s*-eq\s*'process'" -and $monitor -match 'config_mutated') -Message 'monitor uses broker state and the process-route v3 contract'
 Assert-True -Condition ($monitor -match 'function\s+ConvertTo-MonitorUtcDateTimeValue' -and $monitor -match 'DateTimeStyles\]::RoundtripKind') -Message 'monitor has a typed UTC timestamp conversion helper'
-Assert-True -Condition ($monitor -match 'HeadroomMonitorProcessPathProbe' -and $monitor -match 'QueryFullProcessImageName' -and $monitor -match 'ProcessQueryLimitedInformation' -and $monitor -match 'function\s+Get-MonitorProcessExecutablePath' -and $monitor -match 'Get-MonitorProcessExecutablePath\s+-ProcessId') -Message 'monitor has the native executable path fallback for elevated processes'
+Assert-True -Condition ($monitor -match 'HeadroomMonitorProcessPathProbe' -and $monitor -match 'QueryFullProcessImageName' -and $monitor -match 'ProcessQueryLimitedInformation' -and $monitor -match 'function\s+Get-MonitorProcessExecutablePath' -and $monitor -match 'Get-MonitorProcessExecutablePath\s+-ProcessId' -and $monitor -match 'function\s+Get-MonitorExactCodexProcessInventory') -Message 'monitor has the native executable path fallback and exact Codex++ inventory'
+Assert-True -Condition ($monitor -match 'function\s+Test-MonitorRouteKeeperIdentity' -and $monitor -match 'blank.*CommandLine|Elevated PowerShell' -and $monitor -match 'keeperIdentityValid') -Message 'monitor accepts verified elevated route keeper identity when command line is hidden'
 $monitorTokens = $null
 $monitorErrors = $null
 $monitorAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $projectRoot 'src\codexpp\Codex++\codexpp-headroom-monitor.ps1'), [ref]$monitorTokens, [ref]$monitorErrors)
@@ -120,7 +129,7 @@ $startPath = Join-Path $projectRoot 'scripts\Start-HeadroomForCodexPP.ps1'
 $tokens = $null
 $errors = $null
 $startAst = [System.Management.Automation.Language.Parser]::ParseFile($startPath, [ref]$tokens, [ref]$errors)
-foreach ($functionName in @('Get-PropertyValue', 'Test-GatewayReadinessSnapshot', 'Test-RouteStateContract', 'ConvertTo-UtcDateTimeValue', 'Test-Ready', 'Wait-StrictReadiness')) {
+foreach ($functionName in @('Get-PropertyValue', 'Get-ConfigProtectedContract', 'Test-ConfigProtectedContract', 'Test-GatewayReadinessSnapshot', 'Test-RouteStateContract', 'Update-RouteStateConfigHash', 'Wait-RouteStateContract', 'ConvertTo-UtcDateTimeValue', 'Test-Ready', 'Wait-StrictReadiness')) {
     $functionAst = @($startAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName }, $true))[0]
     Assert-True -Condition ($null -ne $functionAst) -Message "readiness function exists: $functionName"
     Invoke-Expression $functionAst.Extent.Text
@@ -137,6 +146,56 @@ Assert-True -Condition ($jsonUtcValue -is [DateTime] -and $jsonUtcValue.Kind -eq
 Assert-True -Condition ($jsonOffsetValue -is [DateTime] -and $jsonOffsetValue.Kind -eq [DateTimeKind]::Local -and $jsonOffsetParsed.ToString('o') -eq '2026-08-01T04:00:00.0000000Z') -Message 'ConvertFrom-Json local DateTime from UTC+8 is normalized to UTC'
 Assert-True -Condition ($offsetParsed.ToString('o') -eq '2026-08-01T04:00:00.0000000Z') -Message 'DateTimeOffset input uses UtcDateTime directly'
 Assert-True -Condition (([DateTime]::UtcNow - $expiredParsed).TotalSeconds -gt 2) -Message 'expired timestamp remains outside the managed process start window'
+
+$configProtectionFixture = Join-Path ([IO.Path]::GetTempPath()) ('headroom-config-protection-' + [IO.Path]::GetRandomFileName())
+[IO.Directory]::CreateDirectory($configProtectionFixture) | Out-Null
+try {
+    $protectedConfigPath = Join-Path $configProtectionFixture 'config.toml'
+    $protectedConfig = @'
+model_provider = "CodexPlusPlus"
+model = "fixture-model"
+notify = "never"
+[model_providers.CodexPlusPlus]
+name = "fixture"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://provider.example.invalid/v1"
+experimental_bearer_token = "fixture-token"
+'@
+    [IO.File]::WriteAllText($protectedConfigPath, $protectedConfig, [Text.UTF8Encoding]::new($false))
+    $protectedBefore = Get-ConfigProtectedContract -Path $protectedConfigPath
+    Assert-True -Condition ($protectedBefore.Exists -and $null -eq $protectedBefore.Error -and $protectedBefore.BaseUrl -eq 'https://provider.example.invalid/v1') -Message 'protected config contract reads provider and Base URL without exposing credentials'
+    [IO.File]::WriteAllText($protectedConfigPath, $protectedConfig.Replace('notify = "never"', 'notify = "always"'), [Text.UTF8Encoding]::new($false))
+    $protectedAfterMetadataChange = Get-ConfigProtectedContract -Path $protectedConfigPath
+    Assert-True -Condition (Test-ConfigProtectedContract -Before $protectedBefore -After $protectedAfterMetadataChange) -Message 'manager-owned metadata change does not invalidate protected config contract'
+    [IO.File]::WriteAllText($protectedConfigPath, $protectedConfig.Replace('base_url = "https://provider.example.invalid/v1"', 'base_url = "https://other.example.invalid/v1"'), [Text.UTF8Encoding]::new($false))
+    $protectedAfterBaseUrlChange = Get-ConfigProtectedContract -Path $protectedConfigPath
+    Assert-True -Condition (-not (Test-ConfigProtectedContract -Before $protectedBefore -After $protectedAfterBaseUrlChange)) -Message 'Base URL change invalidates protected config contract'
+
+    [IO.File]::WriteAllText($protectedConfigPath, $protectedConfig.Replace('name = "fixture"', 'name = "manager-metadata"'), [Text.UTF8Encoding]::new($false))
+    $protectedAfterProviderMetadataChange = Get-ConfigProtectedContract -Path $protectedConfigPath
+    Assert-True -Condition (Test-ConfigProtectedContract -Before $protectedBefore -After $protectedAfterProviderMetadataChange) -Message 'provider-section metadata change does not invalidate protected config contract'
+
+    [IO.File]::WriteAllText($protectedConfigPath, $protectedConfig.Replace('wire_api = "responses"', 'wire_api = "chat"'), [Text.UTF8Encoding]::new($false))
+    $protectedAfterWireApiChange = Get-ConfigProtectedContract -Path $protectedConfigPath
+    Assert-True -Condition (-not (Test-ConfigProtectedContract -Before $protectedBefore -After $protectedAfterWireApiChange)) -Message 'wire_api change invalidates protected config contract'
+
+    [IO.File]::WriteAllText($protectedConfigPath, $protectedConfig.Replace('requires_openai_auth = true', 'requires_openai_auth = false'), [Text.UTF8Encoding]::new($false))
+    $protectedAfterAuthChange = Get-ConfigProtectedContract -Path $protectedConfigPath
+    Assert-True -Condition (-not (Test-ConfigProtectedContract -Before $protectedBefore -After $protectedAfterAuthChange)) -Message 'requires_openai_auth change invalidates protected config contract'
+
+    [IO.File]::WriteAllText($protectedConfigPath, $protectedConfig.Replace('experimental_bearer_token = "fixture-token"', 'experimental_bearer_token = "rotated-fixture-token"'), [Text.UTF8Encoding]::new($false))
+    $protectedAfterTokenValueChange = Get-ConfigProtectedContract -Path $protectedConfigPath
+    Assert-True -Condition (Test-ConfigProtectedContract -Before $protectedBefore -After $protectedAfterTokenValueChange) -Message 'bearer-token value rotation preserves presence contract without recording token'
+
+    [IO.File]::WriteAllText($protectedConfigPath, $protectedConfig.Replace('experimental_bearer_token = "fixture-token"', '# bearer token removed'), [Text.UTF8Encoding]::new($false))
+    $protectedAfterTokenRemoval = Get-ConfigProtectedContract -Path $protectedConfigPath
+    Assert-True -Condition (-not (Test-ConfigProtectedContract -Before $protectedBefore -After $protectedAfterTokenRemoval)) -Message 'bearer-token field removal invalidates protected config contract'
+}
+finally {
+    if (Test-Path -LiteralPath $configProtectionFixture) { Remove-Item -LiteralPath $configProtectionFixture -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 $invalidTimestampAccepted = $true
 try { [void](ConvertTo-UtcDateTimeValue -Value 'not-a-timestamp') } catch { $invalidTimestampAccepted = $false }
 Assert-True -Condition (-not $invalidTimestampAccepted) -Message 'invalid timestamp is rejected'
@@ -239,6 +298,48 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $routeContractFixture) { Remove-Item -LiteralPath $routeContractFixture -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# P26 race fixture: route-state config hash lags the live config hash (the
+# one-shot route keeper and a freshly launched Manager both update config
+# metadata around the same moment).  Wait-RouteStateContract must poll and
+# converge instead of failing on the first stale observation.
+$raceFixture = Join-Path ([IO.Path]::GetTempPath()) ('headroom-route-race-' + [IO.Path]::GetRandomFileName())
+[IO.Directory]::CreateDirectory($raceFixture) | Out-Null
+$script:routeStatePath = Join-Path $raceFixture 'route-state.json'
+$raceConfigPath = Join-Path $raceFixture 'config.toml'
+$staleHash = 'stale-config-hash'
+$freshHash = 'fresh-config-hash'
+try {
+    # Live config already has the fresh hash; route-state still carries the
+    # stale hash (the route keeper has not published its refresh yet).
+    [IO.File]::WriteAllText($raceConfigPath, ("[project]`nname = 'race-fixture'`n"), [Text.UTF8Encoding]::new($false))
+    $staleState = [ordered]@{ status = 'pending'; route_scope = 'process'; config_mutated = $false; config_sha256 = $staleHash }
+    [IO.File]::WriteAllText($script:routeStatePath, (($staleState | ConvertTo-Json -Depth 4) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+    $protectedBefore = [pscustomobject]@{ fingerprint = 'race-fixture-protected'; sha256 = $staleHash }
+    function Test-ConfigProtectedContract { param($Before, $After) return $true }
+    function Update-RouteStateConfigHash {
+        param([string]$ConfigHash, [object]$ProtectedContract)
+        # Simulate the route keeper publishing its refresh a little late.
+        Start-Sleep -Milliseconds 600
+        $updated = [ordered]@{ status = 'ready'; route_scope = 'process'; config_mutated = $false; config_sha256 = $ConfigHash }
+        [IO.File]::WriteAllText($script:routeStatePath, (($updated | ConvertTo-Json -Depth 4) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        return $true
+    }
+    $raceStarted = [DateTime]::UtcNow
+    # Note: the production caller passes the live config hash as
+    # ExpectedConfigHash (the route keeper publishes its own refresh; the
+    # wait's refresh branch covers a hash that drifts again while polling);
+    # this fixture deliberately passes a STALE expected hash so the wait's
+    # internal refresh-fallback branch is exercised.  Both paths share the
+    # same poll/converge loop.
+    $waited = Wait-RouteStateContract -ExpectedConfigHash $staleHash -ConfigPath $raceConfigPath -ProtectedContractBefore $protectedBefore -TimeoutSeconds 2 -PollIntervalSeconds 0.2
+    $raceElapsed = ([DateTime]::UtcNow - $raceStarted).TotalSeconds
+    Assert-True -Condition ($waited) -Message 'route-state race converges via polling'
+    Assert-True -Condition ($raceElapsed -ge 0.4) -Message 'polling actually waited for the delayed refresh'
+}
+finally {
+    if (Test-Path -LiteralPath $raceFixture) { Remove-Item -LiteralPath $raceFixture -Recurse -Force -ErrorAction SilentlyContinue }
 }
 $monitorScript = Join-Path $projectRoot 'src\codexpp\Codex++\codexpp-headroom-monitor.ps1'
 $runtimeRoot = Join-Path $projectRoot 'runtime'
@@ -423,5 +524,31 @@ base_url = "https://provider.example.invalid/v1"
 finally {
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue }
 }
+
+# P27a: the root entry must refresh a stale managed-process snapshot when the
+# live set is exactly one Manager and one Client, instead of forcing a restart.
+$p27aRefreshPattern = 'existingCodexProcesses\.Count -eq 2 -and \$managerCount -eq 1 -and \$clientCount -eq 1'
+Assert-True -Condition ($start -match 'Get-ExactExecutableProcesses -ExecutablePaths @\(\$managerExe, \$clientExe\)' -and $start -match $p27aRefreshPattern -and $start -match 'Write-ManagedCodexState' -and $start -match 'Confirm-DirectProcessRestart') -Message 'root refreshes stale managed snapshot for an exact 2-process set instead of restarting'
+Assert-True -Condition ($start.IndexOf('Write-ManagedCodexState', $start.IndexOf('managerCount')) -gt 0) -Message 'snapshot refresh occurs before the confirm-restart fallback'
+
+# P27a: the monitor self-heals a stale managed-process snapshot only when the
+# exact live set matches, and stays red otherwise.
+Assert-True -Condition ($monitor -match 'function\s+Update-StaleManagedCodexState' -and $monitor -match 'Get-MonitorExactCodexProcessInventory' -and $monitor -match 'source_hashes' -and $monitor -match 'Write-AtomicUtf8Text\s+-Path\s+\$script:ManagedCodexStatePath') -Message 'monitor has a fail-closed stale snapshot refresher'
+$monitorUpdateFunction = @($monitorAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Update-StaleManagedCodexState' }, $true))[0]
+Assert-True -Condition ($null -ne $monitorUpdateFunction -and $monitorUpdateFunction.Extent.Text -match 'Count -ne 2' -and $monitorUpdateFunction.Extent.Text -match 'livePids' -and $monitorUpdateFunction.Extent.Text -match 'statePids' -and $monitorUpdateFunction.Extent.Text -match 'started_at_utc') -Message 'monitor stale refresher requires exact 2-process set and differing PIDs'
+$routeFunction2 = @($monitorAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ClientRouteObservation' }, $true))[0]
+Assert-True -Condition ($routeFunction2.Extent.Text -match 'Update-StaleManagedCodexState' -and $routeFunction2.Extent.Text -match 'managedProcessesReady = Test-ManagedCodexProcessState' -and $routeFunction2.Extent.Text -match 'if \(-not \$managedProcessesReady -and \$activeClient\)') -Message 'route observation re-observes stale managed state before declaring red'
+
+# Route pinning: Invoke-OfficialRoutePinning rewrites base_url ONLY inside
+# the codex_local_access section of the official config (never a neighbouring
+# provider), and reports pinned=true with the Gateway URL.  This is the
+# managed-chain guarantee that the official dataplane goes through Headroom
+# on every launch while the manager supplier base_url/key stay untouched.
+$pinFunction = @($startAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-OfficialRoutePinning' }, $true))[0]
+Assert-True -Condition ($null -ne $pinFunction -and $pinFunction.Extent.Text -match 'codex_local_access' -and $pinFunction.Extent.Text -match '18787' -and $pinFunction.Extent.Text -match 'WriteAllText' -and $pinFunction.Extent.Text -match '\[\^') -Message 'startup chain has a section-scoped official route pinning helper'
+Assert-True -Condition ($start -match '\$null = Invoke-OfficialRoutePinning') -Message 'startup chain calls the official route pinning helper'
+$pinCallIndex = $start.IndexOf('$null = Invoke-OfficialRoutePinning')
+$contractSnapshotIndex = $start.IndexOf('$managerConfigProtectedBefore = Get-ConfigProtectedContract')
+Assert-True -Condition ($pinCallIndex -gt 0 -and $contractSnapshotIndex -gt 0 -and $pinCallIndex -lt $contractSnapshotIndex) -Message 'pinning runs before the protected-contract snapshot so disk/contract/route-state agree'
 
 Write-Output 'startup-root fixture tests: PASS'

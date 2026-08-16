@@ -196,6 +196,26 @@ class BrokerContractTests(unittest.IsolatedAsyncioTestCase):
             persisted = config.state_path.read_text(encoding="utf-8")
             self.assertNotIn(secret_body, persisted)
 
+    async def test_correlation_receipt_is_returned_without_body(self) -> None:
+        secret_body = "correlation-body-must-not-be-persisted"
+        response = await self.client.post(
+            "/compress",
+            json={
+                "content": secret_body,
+                "request_id": "gw_request_123",
+                "correlation_id": "corr_456",
+            },
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("gw_request_123", body["request_id"])
+        self.assertEqual("corr_456", body["correlation_id"])
+        health = (await self.client.get("/health")).json()
+        recent = health["recent_requests"][-1]
+        self.assertEqual("gw_request_123", recent["request_id"])
+        self.assertEqual("corr_456", recent["correlation_id"])
+        self.assertNotIn(secret_body, str(health))
+
     async def test_queue_full_returns_passthrough(self) -> None:
         broker = self.app.state.broker
         await broker._capacity.acquire()

@@ -234,6 +234,41 @@ class RemoteKompressReadinessTests(unittest.TestCase):
         self.assertEqual("CPUExecutionProvider", compressor.provider)
         self.assertEqual(2, len(fake.get_calls))
 
+    def test_request_context_is_forwarded_as_opaque_correlation(self) -> None:
+        fake = _FakeClient(
+            ready=_FakeResponse(
+                {
+                    "service": "kompress-broker",
+                    "status": "healthy",
+                    "ready": True,
+                    "provider": "CPUExecutionProvider",
+                    "backend": "onnx_cpu",
+                }
+            ),
+            post=_FakeResponse(
+                {
+                    "compressed": "short result",
+                    "original_tokens": 12,
+                    "compressed_tokens": 2,
+                    "compression_ratio": 0.2,
+                }
+            ),
+        )
+        compressor = self._compressor(fake)
+        self.assertEqual("loaded", compressor.preload())
+        token = self.remote.set_compression_request_context("gw_123", "corr_456")
+        try:
+            result = compressor.compress(
+                "one two three four five six seven eight nine ten eleven twelve"
+            )
+        finally:
+            self.remote.reset_compression_request_context(token)
+        self.assertEqual("short result", result.compressed)
+        call = fake.post_calls[0]
+        self.assertEqual("gw_123", call["json"]["request_id"])
+        self.assertEqual("corr_456", call["json"]["correlation_id"])
+        self.assertEqual("corr_456", call["headers"]["x-headroom-correlation-id"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,7 +37,8 @@ if (-not (Test-Path -LiteralPath $requirements -PathType Leaf)) { throw "require
 if ($LASTEXITCODE -ne 0) { throw 'offline_install_failed' }
 
 if (-not (Test-Path -LiteralPath $sitePackages -PathType Container)) { throw 'headroom_site_packages_missing' }
-foreach ($patchFile in Get-ChildItem -LiteralPath $patchRoot -Recurse -File) {
+foreach ($patchFile in Get-ChildItem -LiteralPath $patchRoot -Recurse -File |
+        Where-Object { $_.Extension -eq '.py' -and $_.FullName -notmatch '(?i)(\\|/)__pycache__(\\|/)' }) {
     $relativePath = [IO.Path]::GetRelativePath($patchRoot, $patchFile.FullName)
     $targetPath = Join-Path $sitePackages $relativePath
     if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) { throw "patch_target_missing:$relativePath" }
