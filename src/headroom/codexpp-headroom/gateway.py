@@ -109,7 +109,7 @@ _TOKEN_COUNTER_FIELDS = (
     "missing_samples",
     "invalid_samples",
 )
-_TOKEN_EXCLUDED_FIELDS = ("bypass", "error", "total")
+_TOKEN_EXCLUDED_FIELDS = ("bypass", "error", "synthetic", "total")
 
 
 def _float_env(name: str, default: float) -> float:
@@ -908,6 +908,8 @@ class MetricsStore:
         policy_mode = str(metric.get("policy_mode", "compress"))
         fallback = str(metric.get("fallback") or "")
         result = str(metric.get("result", "error"))
+        if bool(metric.get("synthetic")) or metric.get("synthetic_run_id") is not None:
+            return False, "synthetic"
         if request_class == "spawned" or policy_mode == "bypass":
             return False, "bypass"
         if request_class != "main" or policy_mode != "compress":
@@ -978,7 +980,11 @@ class MetricsStore:
             eligible, exclusion_reason = self._token_eligibility(safe_metric)
             if not eligible:
                 excluded = token_accounting["excluded"]
-                bucket_name = exclusion_reason if exclusion_reason in {"bypass", "error"} else "error"
+                bucket_name = (
+                    exclusion_reason
+                    if exclusion_reason in set(_TOKEN_EXCLUDED_FIELDS) - {"total"}
+                    else "error"
+                )
                 self._increment_counter(excluded, bucket_name)
                 self._increment_counter(excluded, "total")
             elif safe_metric.get("token_invalid"):

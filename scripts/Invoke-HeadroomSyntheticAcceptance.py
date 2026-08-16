@@ -56,6 +56,7 @@ async def run_window(args: argparse.Namespace) -> dict[str, object]:
     results: dict[str, dict[str, object]] = {}
     timeout_count = 0
     negative_savings = 0
+    synthetic_run_id = f"synthetic-acceptance-{int(time.time())}"
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(90.0),
         follow_redirects=False,
@@ -70,9 +71,11 @@ async def run_window(args: argparse.Namespace) -> dict[str, object]:
             for index in range(args.count):
                 started = time.perf_counter()
                 try:
+                    request_headers = dict(headers)
+                    request_headers["x-headroom-synthetic-run-id"] = synthetic_run_id
                     response = await client.post(
                         f"{args.gateway.rstrip('/')}/v1/compress",
-                        headers=headers,
+                        headers=request_headers,
                         json=payload,
                     )
                     elapsed_ms = (time.perf_counter() - started) * 1000
@@ -115,6 +118,7 @@ async def run_window(args: argparse.Namespace) -> dict[str, object]:
         "schema_version": 1,
         "kind": "synthetic_compress_contract",
         "gateway": args.gateway,
+        "synthetic_run_id": synthetic_run_id,
         "requested_per_class": args.count,
         "classes": results,
         "compression_504_total": timeout_count,
